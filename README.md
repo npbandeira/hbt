@@ -7,6 +7,25 @@ de um servidor na nuvem. Quem inicia todas as conexões é o **cliente**.
  usuário ──► [VPS: porta 2222] ◄══ túnel ══ [hbt cliente] ──► 127.0.0.1:22
 ```
 
+## Instalação rápida (scripts)
+
+```sh
+./scripts/build.sh                                    # testes + binários em dist/
+./scripts/deploy.sh usuario@meu.vps --domain tunnel.exemplo.com   # VPS + cliente local, tudo de uma vez
+```
+
+| Script | Onde roda | O que faz |
+|---|---|---|
+| `scripts/build.sh` | sua máquina | roda os testes e gera `dist/` (nativo + estático musl) |
+| `scripts/install-server.sh` | **no VPS** | instala o serviço systemd `hbt-server`, gera o token, mostra as portas a liberar. Idempotente: atualiza mantendo o token |
+| `scripts/install-client.sh` | sua máquina | copia `hbt` para `~/.local/bin` e (com `--server/--token`) já configura |
+| `scripts/deploy.sh` | sua máquina | build + envia por ssh + instala no VPS + traz o token e configura o cliente |
+
+Depois do deploy, no VPS: `journalctl -u hbt-server -f` (logs) e
+`systemctl restart hbt-server`. O token fica em `/etc/hbt/server.env` (só root lê).
+O deploy exige ssh com `sudo` no VPS. Libere as portas no firewall ao final
+(o script imprime os comandos; ele não mexe no firewall sozinho).
+
 ## Uso (estilo ngrok)
 
 **1. No servidor (VPS com IP público):**
