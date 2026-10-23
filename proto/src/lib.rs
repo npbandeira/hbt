@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -52,8 +52,10 @@ pub enum TunnelSpec {
 /// e o `match` obriga a tratar todas.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Hello {
-    /// "Sou um cliente abrindo um túnel": segue o desafio HMAC.
-    Control,
+    /// "Sou o cliente cujo token tem este id; abrindo um túnel": segue o
+    /// desafio HMAC. O id NÃO é secreto (é só o "nome de usuário"); serve
+    /// para o servidor achar qual chave usar na verificação.
+    Control { token_id: String },
     /// "Sou uma conexão de dados que o servidor pediu via `NewConn`/`NewUdpStream`".
     Accept(ConnId),
 }
@@ -158,25 +160,60 @@ where
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Calcula a resposta ao desafio: HMAC-SHA256(segredo, nonce).
+/// Um token tem a forma `<id>.<segredo>`: o `id` identifica o cliente (e
+/// aparece em listas/logs); o `segredo` (256 bits aleatórios em hex) é o que
+/// prova identidade. Separar os dois permite ao servidor achar o registro
+/// SEM comparar segredos contra todos os clientes.
+pub fn parse_token(token: &str) -> Option<(&str, &str)> {
+    let (id, secret) = token.trim().split_once('.')?;
+    let id_ok = !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    let secret_ok = secret.len() >= 32 && secret.bytes().all(|b| b.is_ascii_alphanumeric());
+    (id_ok && secret_ok).then_some((id, secret))
+}
+
+/// Chave de autenticação derivada do segredo: SHA-256("hbt-token-v1:" + segredo).
+///
+/// O servidor guarda ESTA chave (nunca o segredo cru) e o cliente a recalcula
+/// a partir do token. Honestamente: sem TLS isso NÃO protege contra o vazamento
+/// do arquivo do servidor, porque quem tem a chave consegue responder ao
+/// desafio ("pass-the-hash"). O ganho real vem quando o canal for TLS e o
+/// servidor guardar só um hash da chave (próxima etapa). Já deixamos o formato
+/// pronto para essa migração e o token em si nunca fica gravado no servidor.
+pub fn derive_key(secret: &str) -> [u8; 32] {
+    Sha256::digest(format!("hbt-token-v1:{secret}")).into()
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Calcula a resposta ao desafio: HMAC-SHA256(chave, nonce).
 ///
 /// Por que HMAC e não mandar o token? O segredo nunca trafega: o servidor
 /// manda um nonce (número aleatório de uso único) e o cliente prova que
-/// conhece o segredo assinando-o. Um espião que capture a resposta não pode
+/// conhece a chave assinando-o. Um espião que capture a resposta não pode
 /// reusá-la (o próximo nonce será outro = "replay protection").
 /// Limitação: autentica, mas NÃO criptografa o tráfego (veja docs/GUIDE.md).
-pub fn auth_response(secret: &str, nonce: &[u8; 32]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC aceita qualquer tamanho de chave");
+pub fn auth_response(key: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC aceita qualquer tamanho de chave");
     mac.update(nonce);
     mac.finalize().into_bytes().to_vec()
 }
 
 /// Verifica em tempo constante (`verify_slice`), para não vazar quantos
 /// bytes iniciais batem via diferença de tempo (timing attack).
-pub fn verify_auth(secret: &str, nonce: &[u8; 32], response: &[u8]) -> bool {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC aceita qualquer tamanho de chave");
+pub fn verify_auth(key: &[u8], nonce: &[u8; 32], response: &[u8]) -> bool {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC aceita qualquer tamanho de chave");
     mac.update(nonce);
     mac.verify_slice(response).is_ok()
 }
@@ -224,11 +261,35 @@ mod tests {
     }
 
     #[test]
-    fn auth_accepts_right_secret_only() {
+    fn auth_accepts_right_key_only() {
         let nonce = [7u8; 32];
-        let resp = auth_response("segredo", &nonce);
-        assert!(verify_auth("segredo", &nonce, &resp));
-        assert!(!verify_auth("outro", &nonce, &resp));
-        assert!(!verify_auth("segredo", &[8u8; 32], &resp));
+        let key = derive_key("segredo");
+        let resp = auth_response(&key, &nonce);
+        assert!(verify_auth(&key, &nonce, &resp));
+        assert!(!verify_auth(&derive_key("outro"), &nonce, &resp));
+        assert!(!verify_auth(&key, &[8u8; 32], &resp));
+    }
+
+    #[test]
+    fn token_parsing() {
+        let secret = "a".repeat(64);
+        let t = format!("abc123.{secret}");
+        assert_eq!(parse_token(&t), Some(("abc123", secret.as_str())));
+        assert_eq!(
+            parse_token(&format!("  abc123.{secret}\n")),
+            Some(("abc123", secret.as_str()))
+        );
+        assert_eq!(parse_token("sem-ponto"), None);
+        assert_eq!(parse_token(".segredo"), None);
+        assert_eq!(parse_token("abc.curto"), None);
+        assert_eq!(parse_token(&format!("a/b.{secret}")), None);
+    }
+
+    #[test]
+    fn hex_roundtrip() {
+        let bytes = [0u8, 1, 0xab, 0xff];
+        assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes.to_vec()));
+        assert_eq!(hex_decode("abc"), None);
+        assert_eq!(hex_decode("zz"), None);
     }
 }

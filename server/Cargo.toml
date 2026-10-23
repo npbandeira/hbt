@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 hbt-proto.workspace = true
+serde.workspace = true
 httparse = "1"
 tokio.workspace = true
 clap.workspace = true
@@ -12,3 +13,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 rand.workspace = true
+serde_json = "1.0.154"

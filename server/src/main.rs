@@ -19,13 +19,17 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod tokens;
+
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use hbt_proto::*;
 use rand::Rng;
+use tokens::{TokenRecord, TokenStore};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
@@ -33,8 +37,51 @@ use tokio::time::{interval, timeout};
 use tracing::{debug, info, warn};
 
 #[derive(Parser)]
-#[command(about = "hbt reverse tunnel server")]
-struct Args {
+#[command(version, about = "hbt reverse tunnel server")]
+struct Cli {
+    /// Diretório de dados (guarda tokens.json). Precisa ser gravável.
+    #[arg(long, env = "HBT_DATA_DIR", default_value = "/var/lib/hbt", global = true)]
+    data_dir: PathBuf,
+
+    #[command(subcommand)]
+    cmd: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Roda o servidor.
+    Serve(ServeArgs),
+    /// Gerencia os tokens dos clientes (valem imediatamente, sem reiniciar).
+    Token {
+        #[command(subcommand)]
+        cmd: TokenCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Cria um token. Ele é mostrado UMA vez; o servidor não guarda o segredo.
+    Create {
+        /// Nome do cliente/dispositivo, ex: notebook-ana
+        name: String,
+        /// Limita as portas TCP/UDP que este token pode abrir, ex: 20000-20100
+        #[arg(long, value_parser = parse_range)]
+        ports: Option<RangeInclusive<u16>>,
+        /// Limita os subdomínios HTTP (separados por vírgula), ex: ana,ana-dev
+        #[arg(long, value_delimiter = ',')]
+        subdomains: Option<Vec<String>>,
+        /// Imprime só o token (para scripts).
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Lista os tokens (sem segredos).
+    List,
+    /// Revoga um token por nome ou id; sessões ativas caem em até ~10s.
+    Revoke { name_or_id: String },
+}
+
+#[derive(Parser)]
+struct ServeArgs {
     /// Endereço da porta de controle (onde os clientes se conectam).
     #[arg(long, default_value = "0.0.0.0:7000")]
     control_bind: String,
@@ -57,11 +104,6 @@ struct Args {
     /// proxy com TLS (Caddy/nginx) na frente e use p.ex. 127.0.0.1:8080.
     #[arg(long, env = "HBT_HTTP_BIND", default_value = "0.0.0.0:80")]
     http_bind: String,
-
-    /// Segredo compartilhado. Prefira a variável de ambiente: argumentos de
-    /// linha de comando aparecem para outros usuários em `ps`.
-    #[arg(long, env = "HBT_TOKEN", hide_env_values = true)]
-    token: String,
 }
 
 fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {
@@ -76,6 +118,32 @@ fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {
     Ok(a..=b)
 }
 
+fn token_admin(store: &TokenStore, cmd: TokenCmd) -> Result<()> {
+    match cmd {
+        TokenCmd::Create {
+            name,
+            ports,
+            subdomains,
+            quiet,
+        } => {
+            let token = store.create(&name, ports, subdomains)?;
+            if quiet {
+                println!("{token}");
+            } else {
+                println!("Token '{name}' criado. Guarde-o agora: ele não será mostrado de novo.\n");
+                println!("  {token}\n");
+                println!("No cliente:  hbt configure --server SEU_SERVIDOR --token {token}");
+            }
+        }
+        TokenCmd::List => tokens::print_table(&store.load()?),
+        TokenCmd::Revoke { name_or_id } => {
+            let r = store.revoke(&name_or_id)?;
+            println!("Token '{}' ({}) revogado.", r.name, r.id);
+        }
+    }
+    Ok(())
+}
+
 /// Estado compartilhado entre todos os tasks.
 ///
 /// `Arc<T>` = ponteiro com contagem de referências atômica: vários tasks
@@ -84,7 +152,7 @@ fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {
 /// entre `tokio::spawn`s, que exigem `'static` (não podem emprestar do
 /// escopo que os criou).
 struct State {
-    token: String,
+    tokens: TokenStore,
     tunnel_ip: IpAddr,
     port_range: RangeInclusive<u16>,
     /// Configuração do edge HTTP (None = desabilitado).
@@ -144,8 +212,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let store = TokenStore::new(&cli.data_dir);
+    match cli.cmd {
+        Command::Token { cmd } => token_admin(&store, cmd),
+        Command::Serve(args) => serve(args, store).await,
+    }
+}
 
+async fn serve(args: ServeArgs, tokens: TokenStore) -> Result<()> {
     let http_listener = match args.domain {
         Some(_) => Some(
             TcpListener::bind(&args.http_bind)
@@ -163,7 +238,7 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new(State {
-        token: args.token,
+        tokens,
         tunnel_ip: args.tunnel_ip,
         port_range: args.port_range,
         http,
@@ -178,6 +253,13 @@ async fn main() -> Result<()> {
         "controle em {} | portas públicas {:?}",
         args.control_bind, state.port_range
     );
+    match state.tokens.find("").await {
+        Err(e) => bail!("não consigo ler os tokens: {e:#}"),
+        Ok(_) if state.tokens.load()?.is_empty() => warn!(
+            "nenhum token cadastrado: ninguém consegue conectar. Crie com: hbt-server token create <nome>"
+        ),
+        Ok(_) => {}
+    }
 
     if let Some(l) = http_listener {
         info!(
@@ -224,11 +306,16 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
             }
             Ok(())
         }
-        Hello::Control => {
+        Hello::Control { token_id } => {
             // Qualquer erro antes de "Registered" é reportado ao cliente.
             let (tx, rx) = mpsc::channel::<ServerMsg>(64);
-            match timeout(Duration::from_secs(5), negotiate(&mut stream, &state, &tx)).await {
-                Ok(Ok(bound)) => run_tunnel(stream, state, bound, tx, rx).await,
+            match timeout(
+                Duration::from_secs(5),
+                negotiate(&mut stream, &state, &tx, &token_id),
+            )
+            .await
+            {
+                Ok(Ok((bound, rec))) => run_tunnel(stream, state, bound, rec, tx, rx).await,
                 Ok(Err(e)) => {
                     let _ = write_msg(&mut stream, &ServerMsg::Error(e.to_string())).await;
                     Err(e)
@@ -252,35 +339,59 @@ async fn negotiate(
     stream: &mut TcpStream,
     state: &Arc<State>,
     tx: &mpsc::Sender<ServerMsg>,
-) -> Result<Bound> {
+    token_id: &str,
+) -> Result<(Bound, TokenRecord)> {
+    // Id desconhecido recebe o desafio igual a um id válido e falha só depois
+    // da verificação, com a MESMA mensagem: assim não dá para descobrir quais
+    // ids existem (user enumeration) olhando respostas ou tempo.
+    let record = state.tokens.find(token_id).await?;
+    let key = record
+        .as_ref()
+        .and_then(|r| hex_decode(&r.key))
+        .unwrap_or_else(|| vec![0u8; 32]);
+
     let nonce: [u8; 32] = rand::random();
     write_msg(stream, &ServerMsg::Challenge(nonce)).await?;
 
     let ClientMsg::Auth(mac) = read_msg(stream).await? else {
         bail!("esperava Auth");
     };
-    if !verify_auth(&state.token, &nonce, &mac) {
+    let valid = verify_auth(&key, &nonce, &mac);
+    let Some(record) = record.filter(|_| valid) else {
         bail!("autenticação falhou");
-    }
+    };
     write_msg(stream, &ServerMsg::AuthOk).await?;
+    info!("cliente '{}' autenticado", record.name);
 
     let ClientMsg::Register(spec) = read_msg(stream).await? else {
         bail!("esperava Register");
     };
-    info!("registro: {spec:?}");
+    info!("registro de '{}': {spec:?}", record.name);
     let (bound, public) = match spec {
         TunnelSpec::Tcp { remote_port } => {
-            let (l, port) = bind_port(state, remote_port, TcpListener::bind).await?;
+            let range = port_range_for(state, &record)?;
+            let (l, port) = bind_port(state.tunnel_ip, &range, remote_port, TcpListener::bind).await?;
             (Bound::Tcp(l), Public::Port(port))
         }
         TunnelSpec::Udp { remote_port } => {
-            let (s, port) = bind_port(state, remote_port, UdpSocket::bind).await?;
+            let range = port_range_for(state, &record)?;
+            let (s, port) = bind_port(state.tunnel_ip, &range, remote_port, UdpSocket::bind).await?;
             (Bound::Udp(s), Public::Port(port))
         }
-        TunnelSpec::Http { subdomain } => register_http(state, tx, subdomain)?,
+        TunnelSpec::Http { subdomain } => register_http(state, tx, subdomain, &record)?,
     };
     write_msg(stream, &ServerMsg::Registered { public }).await?;
-    Ok(bound)
+    Ok((bound, record))
+}
+
+/// Faixa que ESTE cliente pode usar: faixa global do servidor ∩ faixa do token.
+fn port_range_for(state: &State, record: &TokenRecord) -> Result<RangeInclusive<u16>> {
+    record.effective_ports(&state.port_range).with_context(|| {
+        format!(
+            "o token '{}' não permite nenhuma porta da faixa do servidor",
+            record.name
+        )
+    })
 }
 
 /// Abre a porta pedida (validando a faixa) ou, se o cliente não pediu
@@ -289,16 +400,21 @@ async fn negotiate(
 /// Genérico sobre COMO abrir (`bind`): serve para TCP e UDP sem duplicar
 /// código. `F` é qualquer função/closure `endereço -> Future<io::Result<T>>`;
 /// `TcpListener::bind` e `UdpSocket::bind` se encaixam direto.
-async fn bind_port<T, F, Fut>(state: &State, requested: Option<u16>, bind: F) -> Result<(T, u16)>
+async fn bind_port<T, F, Fut>(
+    ip: IpAddr,
+    range: &RangeInclusive<u16>,
+    requested: Option<u16>,
+    bind: F,
+) -> Result<(T, u16)>
 where
     F: Fn((IpAddr, u16)) -> Fut,
     Fut: Future<Output = io::Result<T>>,
 {
     if let Some(port) = requested {
-        if !state.port_range.contains(&port) {
-            bail!("porta {port} fora da faixa permitida {:?}", state.port_range);
+        if !range.contains(&port) {
+            bail!("porta {port} fora da faixa permitida para este token ({range:?})");
         }
-        let t = bind((state.tunnel_ip, port))
+        let t = bind((ip, port))
             .await
             .with_context(|| format!("porta {port} indisponível"))?;
         return Ok((t, port));
@@ -306,12 +422,12 @@ where
     for _ in 0..100 {
         // `thread_rng()` não é Send: por isso o gerador vive só nesta linha,
         // nunca atravessa um `.await`.
-        let port = rand::thread_rng().gen_range(state.port_range.clone());
-        if let Ok(t) = bind((state.tunnel_ip, port)).await {
+        let port = rand::thread_rng().gen_range(range.clone());
+        if let Ok(t) = bind((ip, port)).await {
             return Ok((t, port));
         }
     }
-    bail!("nenhuma porta livre na faixa {:?}", state.port_range)
+    bail!("nenhuma porta livre na faixa {range:?}")
 }
 
 /// Subdomínio vira parte de um nome DNS: só `a-z 0-9 -`, 1 a 63 caracteres,
@@ -332,6 +448,7 @@ fn register_http(
     state: &Arc<State>,
     tx: &mpsc::Sender<ServerMsg>,
     requested: Option<String>,
+    record: &TokenRecord,
 ) -> Result<(Bound, Public)> {
     let Some(cfg) = &state.http else {
         bail!("túneis HTTP desabilitados neste servidor (falta --domain)");
@@ -342,9 +459,19 @@ fn register_http(
     // Checar e inserir sob o MESMO lock: senão dois clientes poderiam
     // checar "livre" ao mesmo tempo e ambos registrar (race condition).
     let mut routes = state.routes.lock().unwrap();
-    let sub = match requested {
-        Some(s) => s,
-        None => loop {
+    // Token com lista de subdomínios: só estes. Sem pedir nenhum, usa o
+    // primeiro livre da lista (em vez de sortear um que não seria dele).
+    let sub = match (requested, &record.subdomains) {
+        (Some(s), Some(list)) if !list.contains(&s) => {
+            bail!("subdomínio '{s}' não é permitido para o token '{}'", record.name)
+        }
+        (Some(s), _) => s,
+        (None, Some(list)) => list
+            .iter()
+            .find(|c| !routes.contains_key(*c))
+            .cloned()
+            .context("todos os subdomínios deste token estão em uso")?,
+        (None, None) => loop {
             let candidate = format!("{:08x}", rand::random::<u32>());
             if !routes.contains_key(&candidate) {
                 break candidate;
@@ -375,6 +502,7 @@ async fn run_tunnel(
     stream: TcpStream,
     state: Arc<State>,
     bound: Bound,
+    record: TokenRecord,
     tx: mpsc::Sender<ServerMsg>,
     mut rx: mpsc::Receiver<ServerMsg>,
 ) -> Result<()> {
@@ -403,8 +531,8 @@ async fn run_tunnel(
     let mut tunnel = None;
     let mut _route = None; // com nome: o guard só cai quando a função termina
     match bound {
-        Bound::Tcp(l) => tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(l, state, tx)))),
-        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state, tx)))),
+        Bound::Tcp(l) => tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(l, state.clone(), tx)))),
+        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state.clone(), tx)))),
         Bound::Http(guard) => _route = Some(guard),
     }
 
@@ -412,12 +540,21 @@ async fn run_tunnel(
     loop {
         tokio::select! {
             Some(msg) = rx.recv() => write_msg(&mut wr, &msg).await?,
-            _ = beat.tick() => write_msg(&mut wr, &ServerMsg::Heartbeat).await?,
+            _ = beat.tick() => {
+                // Revogação: se o token sumiu do arquivo, derruba a sessão.
+                // Erro de leitura NÃO derruba (melhor manter túneis de pé
+                // do que cortar todo mundo por um problema momentâneo).
+                if matches!(state.tokens.find(&record.id).await, Ok(None)) {
+                    warn!("token '{}' revogado: encerrando sessão", record.name);
+                    break;
+                }
+                write_msg(&mut wr, &ServerMsg::Heartbeat).await?
+            }
             _ = &mut reader.0 => break,
             _ = tunnel_done(&mut tunnel) => break,
         }
     }
-    info!("túnel encerrado");
+    info!("túnel de '{}' encerrado", record.name);
     // Ao sair, `reader` e `tunnel` sofrem Drop => tasks abortados => o
     // listener é fechado e a porta pública liberada. Isso é RAII.
     Ok(())

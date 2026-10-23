@@ -1,7 +1,7 @@
 //! hbt: CLI do cliente. Roda na máquina que tem o serviço local e expõe
 //! esse serviço através de uma porta pública do `hbt-server`.
 //!
-//!   hbt configure --server meu.vps --token SEGREDO     (uma vez só)
+//!   hbt configure --server meu.vps --token ID.SEGREDO    (uma vez só)
 //!   hbt http 3000          # URL pública para o site local na porta 3000
 //!   hbt tcp 22             # porta pública (sorteada) para o ssh local
 //!   hbt udp 51820          # idem para UDP
@@ -78,8 +78,13 @@ struct PortArgs {
 /// Servidor + token já resolvidos (flag > env > arquivo).
 struct Conn {
     server: String,
-    token: String,
+    /// Parte pública do token: diz ao servidor "quem sou eu".
+    token_id: String,
+    /// Chave derivada do segredo, usada para assinar o desafio.
+    key: [u8; 32],
 }
+
+const BAD_TOKEN: &str = "token inválido: o formato é <id>.<segredo> (gerado por `hbt-server token create`)";
 
 /// O que o usuário pediu, já traduzido: o que registrar e para onde encaminhar.
 struct Plan {
@@ -139,7 +144,9 @@ fn configure(cli: &Cli) -> Result<()> {
         cfg.server = Some(config::with_default_port(s));
     }
     if let Some(t) = &cli.token {
-        cfg.token = Some(t.clone());
+        // Falha cedo: melhor recusar agora do que descobrir na hora de conectar.
+        parse_token(t).context(BAD_TOKEN)?;
+        cfg.token = Some(t.trim().to_owned());
     }
     let path = config::save(&cfg)?;
     println!("configuração salva em {}", path.display());
@@ -156,9 +163,11 @@ fn resolve(cli: &Cli) -> Result<Conn> {
         cli.token.clone().or(file.token).context(
             "token não definido: rode `hbt configure --server HOST --token TOKEN` (ou use --token)",
         )?;
+    let (token_id, secret) = parse_token(&token).context(BAD_TOKEN)?;
     Ok(Conn {
         server: config::with_default_port(&server),
-        token,
+        token_id: token_id.to_owned(),
+        key: derive_key(secret),
     })
 }
 
@@ -248,7 +257,13 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
     let mut ctl = TcpStream::connect(&conn.server)
         .await
         .with_context(|| format!("conectando em {}", conn.server))?;
-    write_msg(&mut ctl, &Hello::Control).await?;
+    write_msg(
+        &mut ctl,
+        &Hello::Control {
+            token_id: conn.token_id.clone(),
+        },
+    )
+    .await?;
 
     let msg: ServerMsg = timeout(Duration::from_secs(5), read_msg(&mut ctl))
         .await
@@ -256,7 +271,7 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
     let ServerMsg::Challenge(nonce) = msg else {
         bail!("esperava Challenge")
     };
-    write_msg(&mut ctl, &ClientMsg::Auth(auth_response(&conn.token, &nonce))).await?;
+    write_msg(&mut ctl, &ClientMsg::Auth(auth_response(&conn.key, &nonce))).await?;
 
     match timeout(Duration::from_secs(5), read_msg(&mut ctl))
         .await

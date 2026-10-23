@@ -2,16 +2,14 @@
 //! Rode com: cargo test -p hbt-e2e
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
-
-const TOKEN: &str = "segredo-de-teste";
 
 /// Compila os binários uma vez e devolve o diretório onde ficam.
 fn bin_dir() -> PathBuf {
@@ -42,40 +40,82 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn spawn(bin: &str, args: &[&str], token: &str) -> Child {
-    Command::new(bin_dir().join(bin))
-        .args(args)
-        .env("HBT_TOKEN", token)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true) // sem isso, falha de teste deixaria processos órfãos
-        .spawn()
-        .unwrap()
+/// Comando de um binário do projeto, com ambiente limpo de HBT_* herdados.
+fn cmd(bin: &str) -> Command {
+    let mut c = Command::new(bin_dir().join(bin));
+    c.env_remove("HBT_TOKEN")
+        .env_remove("HBT_SERVER")
+        .env_remove("HBT_DOMAIN")
+        .env_remove("HBT_DATA_DIR")
+        .kill_on_drop(true); // sem isso, falha de teste deixaria processos órfãos
+    c
 }
 
-fn start_server(control: u16, range: &str) -> Child {
-    let c = format!("127.0.0.1:{control}");
-    spawn(
-        "hbt-server",
-        &[
-            "--control-bind",
-            &c,
-            "--tunnel-ip",
-            "127.0.0.1",
-            "--port-range",
-            range,
-        ],
-        TOKEN,
-    )
+fn spawn_quiet(mut c: Command) -> Child {
+    c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
 }
 
-fn start_client(control: u16, token: &str, kind: &str, local: u16, remote: u16) -> Child {
-    let (s, l, r) = (
-        format!("127.0.0.1:{control}"),
-        local.to_string(),
-        remote.to_string(),
-    );
-    spawn("hbt", &["--server", &s, kind, &l, "--remote-port", &r], token)
+/// Servidor de teste: diretório de dados próprio + processo `serve`.
+struct Fixture {
+    dir: PathBuf,
+    control: u16,
+    _server: Child,
+}
+
+impl Fixture {
+    /// `range` = faixa pública de portas; `extra` = flags extras do `serve`.
+    fn start(range: &str, extra: &[&str]) -> Fixture {
+        let control = free_port();
+        let dir = std::env::temp_dir().join(format!("hbt-e2e-{}-{control}", std::process::id()));
+        let mut c = cmd("hbt-server");
+        c.args(["--data-dir"]).arg(&dir);
+        c.args(["serve", "--control-bind", &format!("127.0.0.1:{control}")]);
+        c.args(["--tunnel-ip", "127.0.0.1", "--port-range", range]);
+        c.args(extra);
+        Fixture {
+            dir,
+            control,
+            _server: spawn_quiet(c),
+        }
+    }
+
+    fn addr(&self) -> String {
+        format!("127.0.0.1:{}", self.control)
+    }
+
+    /// `hbt-server token <args...>` e devolve o stdout.
+    fn token_cmd(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(bin_dir().join("hbt-server"))
+            .arg("--data-dir")
+            .arg(&self.dir)
+            .arg("token")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// Cria um token e devolve a string `<id>.<segredo>`.
+    fn token(&self, name: &str, extra: &[&str]) -> String {
+        let mut args = vec!["create", name, "--quiet"];
+        args.extend_from_slice(extra);
+        let out = self.token_cmd(&args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn client(&self, token: &str, args: &[&str]) -> Command {
+        let mut c = cmd("hbt");
+        c.args(["--server", &self.addr()])
+            .args(args)
+            .env("HBT_TOKEN", token);
+        c
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 async fn tcp_echo_server() -> u16 {
@@ -109,32 +149,55 @@ async fn udp_echo_server() -> u16 {
     port
 }
 
-#[tokio::test]
-async fn tcp_tunnel_echoes_multiple_connections() {
-    let (control, public) = (free_port(), free_port());
-    let _server = start_server(control, &format!("{public}-{public}"));
-    let echo = tcp_echo_server().await;
-    let _client = start_client(control, TOKEN, "tcp", echo, public);
-
-    let addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
-    // Servidor/cliente levam um instante para subir: tenta por até 10s.
-    let mut ok = false;
+/// Tenta por até ~10s fazer um eco "ping" pelo túnel TCP.
+async fn tcp_echo_works(port: u16) -> bool {
     for _ in 0..50 {
-        if let Ok(mut s) = TcpStream::connect(addr).await {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)).await {
             if s.write_all(b"ping").await.is_ok() {
                 let mut buf = [0u8; 4];
                 if let Ok(Ok(_)) = timeout(Duration::from_millis(500), s.read_exact(&mut buf)).await {
-                    assert_eq!(&buf, b"ping");
-                    ok = true;
-                    break;
+                    return &buf == b"ping";
                 }
             }
         }
         sleep(Duration::from_millis(200)).await;
     }
-    assert!(ok, "túnel TCP nunca respondeu");
+    false
+}
+
+/// Sobe o cliente com stdout capturado e devolve a URL do banner "Forwarding".
+async fn banner_url(mut c: Command) -> (Child, String) {
+    let mut child = c.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let url = timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Some(rest) = line.strip_prefix("Forwarding") {
+                return rest.split_whitespace().next().unwrap().to_owned();
+            }
+        }
+        panic!("cliente terminou sem imprimir o banner");
+    })
+    .await
+    .expect("sem banner em 10s");
+    (child, url)
+}
+
+// ------------------------------------------------------------------ túneis
+
+#[tokio::test]
+async fn tcp_tunnel_echoes_multiple_connections() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
+    let echo = tcp_echo_server().await;
+    let _client = spawn_quiet(fx.client(
+        &token,
+        &["tcp", &echo.to_string(), "--remote-port", &public.to_string()],
+    ));
+    assert!(tcp_echo_works(public).await, "túnel TCP nunca respondeu");
 
     // Várias conexões simultâneas, cada uma com seu payload.
+    let addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
     let mut tasks = vec![];
     for i in 0..10u8 {
         tasks.push(tokio::spawn(async move {
@@ -155,10 +218,14 @@ async fn tcp_tunnel_echoes_multiple_connections() {
 
 #[tokio::test]
 async fn udp_tunnel_echoes_and_keeps_peers_separate() {
-    let (control, public) = (free_port(), free_port());
-    let _server = start_server(control, &format!("{public}-{public}"));
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
     let echo = udp_echo_server().await;
-    let _client = start_client(control, TOKEN, "udp", echo, public);
+    let _client = spawn_quiet(fx.client(
+        &token,
+        &["udp", &echo.to_string(), "--remote-port", &public.to_string()],
+    ));
 
     let dest = format!("127.0.0.1:{public}");
     // Dois peers distintos: cada um deve receber SÓ a própria resposta.
@@ -178,28 +245,30 @@ async fn udp_tunnel_echoes_and_keeps_peers_separate() {
 }
 
 #[tokio::test]
-async fn wrong_token_makes_client_exit_with_error() {
-    let (control, public) = (free_port(), free_port());
-    let _server = start_server(control, &format!("{public}-{public}"));
-    let mut client = start_client(control, "token-errado", "tcp", 1, public);
-    let status = timeout(Duration::from_secs(10), client.wait())
-        .await
-        .expect("cliente deveria sair")
-        .unwrap();
-    assert!(!status.success());
+async fn server_picks_a_random_port_when_none_requested() {
+    let lo = free_port();
+    let hi = lo.saturating_add(20);
+    let fx = Fixture::start(&format!("{lo}-{hi}"), &[]);
+    let token = fx.token("t", &[]);
+    let echo = tcp_echo_server().await;
+    let (_client, url) = banner_url(fx.client(&token, &["tcp", &echo.to_string()])).await;
+
+    let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+    assert!((lo..=hi).contains(&port), "porta {port} fora de {lo}-{hi}");
+    assert!(tcp_echo_works(port).await);
 }
 
 #[tokio::test]
-async fn port_outside_range_is_refused() {
-    let (control, allowed, denied) = (free_port(), free_port(), free_port());
-    let _server = start_server(control, &format!("{allowed}-{allowed}"));
-    let _client = start_client(control, TOKEN, "tcp", 1, denied);
+async fn port_outside_server_range_is_refused() {
+    let (allowed, denied) = (free_port(), free_port());
+    let fx = Fixture::start(&format!("{allowed}-{allowed}"), &[]);
+    let token = fx.token("t", &[]);
+    let _client = spawn_quiet(fx.client(&token, &["tcp", "1", "--remote-port", &denied.to_string()]));
     sleep(Duration::from_millis(1500)).await;
-    assert!(
-        TcpStream::connect(("127.0.0.1", denied)).await.is_err(),
-        "porta fora da faixa não deveria abrir"
-    );
+    assert!(TcpStream::connect(("127.0.0.1", denied)).await.is_err());
 }
+
+// -------------------------------------------------------------------- http
 
 /// Servidor HTTP mínimo: responde "ok" a qualquer requisição.
 async fn http_ok_server() -> u16 {
@@ -226,71 +295,64 @@ async fn http_ok_server() -> u16 {
     port
 }
 
-/// Faz um GET cru para o edge HTTP com o `Host` dado e devolve a resposta inteira.
+/// Faz um GET cru para o edge HTTP com o `Host` dado e devolve a resposta inteira
+/// (vazia se o servidor ainda está subindo).
 async fn http_get(edge: u16, host: &str) -> String {
-    // Servidor ainda subindo: devolve vazio e quem chama tenta de novo.
     let Ok(mut s) = TcpStream::connect(("127.0.0.1", edge)).await else {
         return String::new();
     };
     let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut out = String::new();
-    timeout(Duration::from_secs(5), s.read_to_string(&mut out))
-        .await
-        .unwrap()
-        .unwrap();
+    let _ = timeout(Duration::from_secs(5), s.read_to_string(&mut out)).await;
     out
 }
 
-#[tokio::test]
-async fn http_tunnel_routes_by_host_header() {
-    let (control, public, edge) = (free_port(), free_port(), free_port());
-    let (c, r, h) = (
-        format!("127.0.0.1:{control}"),
-        format!("{public}-{public}"),
-        format!("127.0.0.1:{edge}"),
-    );
-    let _server = spawn(
-        "hbt-server",
-        &[
-            "--control-bind",
-            &c,
-            "--tunnel-ip",
-            "127.0.0.1",
-            "--port-range",
-            &r,
-            "--domain",
-            "localhost",
-            "--http-bind",
-            &h,
-        ],
-        TOKEN,
-    );
-    let web = http_ok_server().await;
-    let web_s = web.to_string();
-    let _client = spawn(
-        "hbt",
-        &["--server", &c, "http", &web_s, "--subdomain", "demo"],
-        TOKEN,
-    );
-
-    // Espera o túnel ficar de pé (com e sem :porta no Host, ambos devem rotear).
-    let host = format!("demo.localhost:{edge}");
+/// Repete o GET até a resposta conter `needle` (ou ~10s).
+async fn http_wait(edge: u16, host: &str, needle: &str) -> String {
     let mut resp = String::new();
     for _ in 0..50 {
-        resp = http_get(edge, &host).await;
-        if resp.contains("200 OK") {
+        resp = http_get(edge, host).await;
+        if resp.contains(needle) {
             break;
         }
         sleep(Duration::from_millis(200)).await;
     }
+    resp
+}
+
+/// Servidor com HTTP em `localhost`; devolve (fixture, porta do edge).
+fn http_fixture() -> (Fixture, u16) {
+    let edge = free_port();
+    let public = free_port();
+    let fx = Fixture::start(
+        &format!("{public}-{public}"),
+        &[
+            "--domain",
+            "localhost",
+            "--http-bind",
+            &format!("127.0.0.1:{edge}"),
+        ],
+    );
+    (fx, edge)
+}
+
+#[tokio::test]
+async fn http_tunnel_routes_by_host_header() {
+    let (fx, edge) = http_fixture();
+    let token = fx.token("t", &[]);
+    let web = http_ok_server().await;
+    let _client = spawn_quiet(fx.client(&token, &["http", &web.to_string(), "--subdomain", "demo"]));
+
+    // Com :porta no Host também deve rotear.
+    let resp = http_wait(edge, &format!("demo.localhost:{edge}"), "200 OK").await;
     assert!(
         resp.starts_with("HTTP/1.1 200 OK") && resp.ends_with("ok"),
         "resposta: {resp:?}"
     );
     assert!(
         http_get(edge, "DEMO.localhost").await.contains("200 OK"),
-        "Host deve ser case-insensitive"
+        "Host é case-insensitive"
     );
 
     // Subdomínio sem túnel e domínio errado => 404.
@@ -304,74 +366,162 @@ async fn http_tunnel_routes_by_host_header() {
 
 #[tokio::test]
 async fn http_is_refused_when_server_has_no_domain() {
-    let (control, public) = (free_port(), free_port());
-    let _server = start_server(control, &format!("{public}-{public}"));
-    let c = format!("127.0.0.1:{control}");
-    let mut client = spawn("hbt", &["--server", &c, "http", "1"], TOKEN);
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
+    let mut client = spawn_quiet(fx.client(&token, &["http", "1"]));
     // Recusa é não-fatal (o cliente tenta de novo), então ele NÃO deve sair sozinho.
     assert!(timeout(Duration::from_secs(2), client.wait()).await.is_err());
 }
 
-/// Sobe o cliente com stdout capturado e devolve a URL do banner "Forwarding".
-async fn banner_url(cmd: &mut Command) -> (Child, String) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+// ------------------------------------------------------- autenticação / ACL
+
+#[tokio::test]
+async fn wrong_secret_makes_client_exit_with_error() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
+    let (id, _) = token.split_once('.').unwrap();
+    let forged = format!("{id}.{}", "0".repeat(64)); // id certo, segredo errado
+    let mut client = spawn_quiet(fx.client(&forged, &["tcp", "1"]));
+    let st = timeout(Duration::from_secs(10), client.wait())
+        .await
+        .expect("cliente deveria sair")
         .unwrap();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let url = timeout(Duration::from_secs(10), async {
-        while let Some(line) = lines.next_line().await.unwrap() {
-            if let Some(rest) = line.strip_prefix("Forwarding") {
-                return rest.split_whitespace().next().unwrap().to_owned();
-            }
-        }
-        panic!("cliente terminou sem imprimir o banner");
-    })
-    .await
-    .expect("sem banner em 10s");
-    (child, url)
+    assert!(!st.success());
 }
 
 #[tokio::test]
-async fn server_picks_a_random_port_when_none_requested() {
-    let (control, lo) = (free_port(), free_port());
-    let hi = lo.saturating_add(20);
-    let _server = start_server(control, &format!("{lo}-{hi}"));
-    sleep(Duration::from_millis(500)).await;
-    let echo = tcp_echo_server().await;
-
-    let (c, e) = (format!("127.0.0.1:{control}"), echo.to_string());
-    let mut cmd = Command::new(bin_dir().join("hbt"));
-    cmd.args(["--server", &c, "tcp", &e]).env("HBT_TOKEN", TOKEN);
-    let (_client, url) = banner_url(&mut cmd).await;
-
-    let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
-    assert!((lo..=hi).contains(&port), "porta {port} fora de {lo}-{hi}");
-    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    s.write_all(b"oi").await.unwrap();
-    let mut buf = [0u8; 2];
-    timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+async fn unknown_token_id_is_rejected_like_a_wrong_secret() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    fx.token("t", &[]);
+    let forged = format!("deadbeef.{}", "1".repeat(64));
+    let mut client = spawn_quiet(fx.client(&forged, &["tcp", "1"]));
+    let st = timeout(Duration::from_secs(10), client.wait())
         .await
-        .unwrap()
+        .expect("cliente deveria sair")
         .unwrap();
-    assert_eq!(&buf, b"oi");
+    assert!(!st.success());
 }
+
+#[tokio::test]
+async fn token_port_acl_is_enforced() {
+    let base = free_port();
+    let (ok_port, bad_port) = (base, base.saturating_add(1));
+    // Servidor permite as duas; o TOKEN só permite a primeira.
+    let fx = Fixture::start(&format!("{ok_port}-{bad_port}"), &[]);
+    let token = fx.token("restrito", &["--ports", &format!("{ok_port}-{ok_port}")]);
+    let echo = tcp_echo_server().await;
+    let e = echo.to_string();
+
+    let _denied = spawn_quiet(fx.client(&token, &["tcp", &e, "--remote-port", &bad_port.to_string()]));
+    sleep(Duration::from_millis(1500)).await;
+    assert!(
+        TcpStream::connect(("127.0.0.1", bad_port)).await.is_err(),
+        "porta fora do token abriu"
+    );
+
+    let _allowed = spawn_quiet(fx.client(&token, &["tcp", &e, "--remote-port", &ok_port.to_string()]));
+    assert!(
+        tcp_echo_works(ok_port).await,
+        "porta permitida pelo token não funcionou"
+    );
+}
+
+#[tokio::test]
+async fn token_subdomain_acl_is_enforced() {
+    let (fx, edge) = http_fixture();
+    let token = fx.token("ana", &["--subdomains", "ana"]);
+    let web = http_ok_server().await;
+    let w = web.to_string();
+
+    // Pedir subdomínio fora da lista: nunca roteia.
+    let mut denied = spawn_quiet(fx.client(&token, &["http", &w, "--subdomain", "outro"]));
+    sleep(Duration::from_millis(1500)).await;
+    assert!(http_get(edge, "outro.localhost")
+        .await
+        .starts_with("HTTP/1.1 404"));
+    let _ = denied.kill().await;
+
+    // Sem pedir nenhum: o servidor usa o da lista ("ana").
+    let _ok = spawn_quiet(fx.client(&token, &["http", &w]));
+    let resp = http_wait(edge, "ana.localhost", "200 OK").await;
+    assert!(resp.contains("200 OK"), "resposta: {resp:?}");
+}
+
+#[tokio::test]
+async fn revoking_a_token_drops_the_live_session_and_blocks_reconnect() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("vai-ser-revogado", &[]);
+    let echo = tcp_echo_server().await;
+    let mut client = spawn_quiet(fx.client(
+        &token,
+        &["tcp", &echo.to_string(), "--remote-port", &public.to_string()],
+    ));
+    assert!(
+        tcp_echo_works(public).await,
+        "túnel deveria funcionar antes da revogação"
+    );
+
+    let out = fx.token_cmd(&["revoke", "vai-ser-revogado"]);
+    assert!(out.status.success());
+
+    // Em até ~1 heartbeat o servidor derruba a sessão; o cliente reconecta,
+    // é recusado na autenticação (erro fatal) e SAI.
+    let st = timeout(Duration::from_secs(30), client.wait())
+        .await
+        .expect("cliente deveria desistir após a revogação")
+        .unwrap();
+    assert!(!st.success());
+    assert!(
+        TcpStream::connect(("127.0.0.1", public)).await.is_err(),
+        "porta pública deveria ter sido liberada"
+    );
+}
+
+#[tokio::test]
+async fn token_cli_create_list_revoke() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token(
+        "notebook",
+        &["--ports", "20000-20010", "--subdomains", "ana,ana-dev"],
+    );
+    let (id, secret) = token.split_once('.').unwrap();
+
+    let list = String::from_utf8(fx.token_cmd(&["list"]).stdout).unwrap();
+    assert!(list.contains("notebook") && list.contains(id) && list.contains("20000-20010"));
+    assert!(list.contains("ana,ana-dev"));
+    assert!(!list.contains(secret), "list não pode mostrar o segredo");
+    let on_disk = std::fs::read_to_string(fx.dir.join("tokens.json")).unwrap();
+    assert!(!on_disk.contains(secret), "o segredo cru não pode estar no disco");
+
+    assert!(
+        !fx.token_cmd(&["create", "notebook"]).status.success(),
+        "nome duplicado"
+    );
+    assert!(fx.token_cmd(&["revoke", "notebook"]).status.success());
+    assert!(!fx.token_cmd(&["revoke", "notebook"]).status.success());
+    let list = String::from_utf8(fx.token_cmd(&["list"]).stdout).unwrap();
+    assert!(list.contains("nenhum token"));
+}
+
+// ---------------------------------------------------------------- configure
 
 #[tokio::test]
 async fn configure_saves_credentials_so_no_flags_are_needed() {
-    let (control, public) = (free_port(), free_port());
-    let _server = start_server(control, &format!("{public}-{public}"));
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
     let echo = tcp_echo_server().await;
 
     // Diretório de config isolado: o teste nunca toca no ~/.config real.
-    let home = std::env::temp_dir().join(format!("hbt-e2e-{}-{control}", std::process::id()));
+    let home = fx.dir.join("home");
     let hbt = bin_dir().join("hbt");
-    let c = format!("127.0.0.1:{control}");
     let ok = std::process::Command::new(&hbt)
-        .args(["configure", "--server", &c, "--token", TOKEN])
+        .args(["configure", "--server", &fx.addr(), "--token", &token])
         .env("XDG_CONFIG_HOME", &home)
         .env_remove("HBT_TOKEN")
         .env_remove("HBT_SERVER")
@@ -391,27 +541,43 @@ async fn configure_saves_credentials_so_no_flags_are_needed() {
     }
 
     // Agora SEM --server, SEM --token e SEM env: tudo vem do arquivo.
-    let (e, p) = (echo.to_string(), public.to_string());
-    let mut cmd = Command::new(&hbt);
-    cmd.args(["tcp", &e, "--remote-port", &p])
-        .env("XDG_CONFIG_HOME", &home)
-        .env_remove("HBT_TOKEN")
-        .env_remove("HBT_SERVER");
-    let (_client, url) = banner_url(&mut cmd).await;
+    let mut c = cmd("hbt");
+    c.args(["tcp", &echo.to_string(), "--remote-port", &public.to_string()])
+        .env("XDG_CONFIG_HOME", &home);
+    let (_client, url) = banner_url(c).await;
     assert_eq!(url, format!("tcp://127.0.0.1:{public}"));
-    let _ = std::fs::remove_dir_all(&home);
+}
+
+fn isolated_config(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("hbt-e2e-{tag}-{}", std::process::id()))
+}
+
+fn hbt_output(home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(bin_dir().join("hbt"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", home)
+        .env_remove("HBT_TOKEN")
+        .env_remove("HBT_SERVER")
+        .output()
+        .unwrap()
 }
 
 #[test]
 fn client_without_configuration_explains_what_to_do() {
-    let home = std::env::temp_dir().join(format!("hbt-e2e-empty-{}", std::process::id()));
-    let out = std::process::Command::new(bin_dir().join("hbt"))
-        .args(["http", "3000"])
-        .env("XDG_CONFIG_HOME", &home)
-        .env_remove("HBT_TOKEN")
-        .env_remove("HBT_SERVER")
-        .output()
-        .unwrap();
+    let home = isolated_config("empty");
+    let out = hbt_output(&home, &["http", "3000"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("hbt configure"));
+}
+
+#[test]
+fn configure_rejects_malformed_tokens() {
+    let home = isolated_config("badtoken");
+    let out = hbt_output(&home, &["configure", "--server", "x", "--token", "sem-formato"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("<id>.<segredo>"));
+    assert!(
+        !home.join("hbt/config.toml").exists(),
+        "não deve gravar token inválido"
+    );
 }
