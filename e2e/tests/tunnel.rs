@@ -72,14 +72,10 @@ fn start_server(control: u16, range: &str) -> Child {
 fn start_client(control: u16, token: &str, kind: &str, local: u16, remote: u16) -> Child {
     let (s, l, r) = (
         format!("127.0.0.1:{control}"),
-        format!("127.0.0.1:{local}"),
+        local.to_string(),
         remote.to_string(),
     );
-    spawn(
-        "hbt",
-        &["--server", &s, kind, "--local", &l, "--remote-port", &r],
-        token,
-    )
+    spawn("hbt", &["--server", &s, kind, &l, "--remote-port", &r], token)
 }
 
 async fn tcp_echo_server() -> u16 {
@@ -314,4 +310,108 @@ async fn http_is_refused_when_server_has_no_domain() {
     let mut client = spawn("hbt", &["--server", &c, "http", "1"], TOKEN);
     // Recusa é não-fatal (o cliente tenta de novo), então ele NÃO deve sair sozinho.
     assert!(timeout(Duration::from_secs(2), client.wait()).await.is_err());
+}
+
+/// Sobe o cliente com stdout capturado e devolve a URL do banner "Forwarding".
+async fn banner_url(cmd: &mut Command) -> (Child, String) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let url = timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if let Some(rest) = line.strip_prefix("Forwarding") {
+                return rest.split_whitespace().next().unwrap().to_owned();
+            }
+        }
+        panic!("cliente terminou sem imprimir o banner");
+    })
+    .await
+    .expect("sem banner em 10s");
+    (child, url)
+}
+
+#[tokio::test]
+async fn server_picks_a_random_port_when_none_requested() {
+    let (control, lo) = (free_port(), free_port());
+    let hi = lo.saturating_add(20);
+    let _server = start_server(control, &format!("{lo}-{hi}"));
+    sleep(Duration::from_millis(500)).await;
+    let echo = tcp_echo_server().await;
+
+    let (c, e) = (format!("127.0.0.1:{control}"), echo.to_string());
+    let mut cmd = Command::new(bin_dir().join("hbt"));
+    cmd.args(["--server", &c, "tcp", &e]).env("HBT_TOKEN", TOKEN);
+    let (_client, url) = banner_url(&mut cmd).await;
+
+    let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+    assert!((lo..=hi).contains(&port), "porta {port} fora de {lo}-{hi}");
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    s.write_all(b"oi").await.unwrap();
+    let mut buf = [0u8; 2];
+    timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"oi");
+}
+
+#[tokio::test]
+async fn configure_saves_credentials_so_no_flags_are_needed() {
+    let (control, public) = (free_port(), free_port());
+    let _server = start_server(control, &format!("{public}-{public}"));
+    let echo = tcp_echo_server().await;
+
+    // Diretório de config isolado: o teste nunca toca no ~/.config real.
+    let home = std::env::temp_dir().join(format!("hbt-e2e-{}-{control}", std::process::id()));
+    let hbt = bin_dir().join("hbt");
+    let c = format!("127.0.0.1:{control}");
+    let ok = std::process::Command::new(&hbt)
+        .args(["configure", "--server", &c, "--token", TOKEN])
+        .env("XDG_CONFIG_HOME", &home)
+        .env_remove("HBT_TOKEN")
+        .env_remove("HBT_SERVER")
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(home.join("hbt/config.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "arquivo com segredo deve ser privado");
+    }
+
+    // Agora SEM --server, SEM --token e SEM env: tudo vem do arquivo.
+    let (e, p) = (echo.to_string(), public.to_string());
+    let mut cmd = Command::new(&hbt);
+    cmd.args(["tcp", &e, "--remote-port", &p])
+        .env("XDG_CONFIG_HOME", &home)
+        .env_remove("HBT_TOKEN")
+        .env_remove("HBT_SERVER");
+    let (_client, url) = banner_url(&mut cmd).await;
+    assert_eq!(url, format!("tcp://127.0.0.1:{public}"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn client_without_configuration_explains_what_to_do() {
+    let home = std::env::temp_dir().join(format!("hbt-e2e-empty-{}", std::process::id()));
+    let out = std::process::Command::new(bin_dir().join("hbt"))
+        .args(["http", "3000"])
+        .env("XDG_CONFIG_HOME", &home)
+        .env_remove("HBT_TOKEN")
+        .env_remove("HBT_SERVER")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hbt configure"));
 }

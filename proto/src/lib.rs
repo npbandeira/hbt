@@ -33,11 +33,12 @@ pub type ConnId = u128;
 /// subdomínio num túnel UDP (em vez de um campo opcional ignorado).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TunnelSpec {
+    /// `None` = o servidor sorteia uma porta livre da faixa permitida.
     Tcp {
-        remote_port: u16,
+        remote_port: Option<u16>,
     },
     Udp {
-        remote_port: u16,
+        remote_port: Option<u16>,
     },
     /// Túnel HTTP: o servidor roteia por `Host: <subdomínio>.<domínio>`.
     /// `None` = servidor sorteia um subdomínio.
@@ -57,14 +58,23 @@ pub enum Hello {
     Accept(ConnId),
 }
 
+/// Endereço público do túnel. O servidor não sabe com que nome o mundo o
+/// enxerga em TCP/UDP (só o cliente sabe o host que discou), então para esses
+/// devolve só a porta; em HTTP devolve a URL completa (ele conhece o domínio).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Public {
+    Url(String),
+    Port(u16),
+}
+
 /// Mensagens do servidor -> cliente no canal de controle.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Challenge([u8; 32]),
     AuthOk,
-    /// `public` é o endereço para mostrar ao usuário (ex.: `http://abc.exemplo.com`).
+    /// `public` diz como o túnel ficou acessível.
     Registered {
-        public: String,
+        public: Public,
     },
     /// Chegou um usuário público (TCP): abra uma conexão de dados com este id.
     NewConn(ConnId),

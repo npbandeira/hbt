@@ -15,6 +15,7 @@
 //!               cliente conecta no serviço local e cola as duas pontas
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
@@ -24,6 +25,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hbt_proto::*;
+use rand::Rng;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
@@ -47,12 +49,13 @@ struct Args {
 
     /// Domínio base dos túneis HTTP: `abc.<domain>` vai para o túnel `abc`.
     /// Sem isso, túneis HTTP ficam desabilitados.
-    #[arg(long)]
+    #[arg(long, env = "HBT_DOMAIN")]
     domain: Option<String>,
 
-    /// Onde escutar requisições HTTP públicas (usado com --domain). Para
-    /// HTTPS, ponha um proxy com TLS (Caddy/nginx) na frente deste endereço.
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// Onde escutar requisições HTTP públicas (usado com --domain). A porta 80
+    /// exige root ou `setcap cap_net_bind_service=+ep`. Para HTTPS, ponha um
+    /// proxy com TLS (Caddy/nginx) na frente e use p.ex. 127.0.0.1:8080.
+    #[arg(long, env = "HBT_HTTP_BIND", default_value = "0.0.0.0:80")]
     http_bind: String,
 
     /// Segredo compartilhado. Prefira a variável de ambiente: argumentos de
@@ -267,14 +270,12 @@ async fn negotiate(
     info!("registro: {spec:?}");
     let (bound, public) = match spec {
         TunnelSpec::Tcp { remote_port } => {
-            let addr = allowed_addr(state, remote_port)?;
-            let l = TcpListener::bind(addr).await.context("porta TCP indisponível")?;
-            (Bound::Tcp(l), format!("porta {remote_port}"))
+            let (l, port) = bind_port(state, remote_port, TcpListener::bind).await?;
+            (Bound::Tcp(l), Public::Port(port))
         }
         TunnelSpec::Udp { remote_port } => {
-            let addr = allowed_addr(state, remote_port)?;
-            let s = UdpSocket::bind(addr).await.context("porta UDP indisponível")?;
-            (Bound::Udp(s), format!("porta {remote_port}"))
+            let (s, port) = bind_port(state, remote_port, UdpSocket::bind).await?;
+            (Bound::Udp(s), Public::Port(port))
         }
         TunnelSpec::Http { subdomain } => register_http(state, tx, subdomain)?,
     };
@@ -282,11 +283,35 @@ async fn negotiate(
     Ok(bound)
 }
 
-fn allowed_addr(state: &State, port: u16) -> Result<(IpAddr, u16)> {
-    if !state.port_range.contains(&port) {
-        bail!("porta {port} fora da faixa permitida {:?}", state.port_range);
+/// Abre a porta pedida (validando a faixa) ou, se o cliente não pediu
+/// nenhuma, sorteia portas da faixa até achar uma livre.
+///
+/// Genérico sobre COMO abrir (`bind`): serve para TCP e UDP sem duplicar
+/// código. `F` é qualquer função/closure `endereço -> Future<io::Result<T>>`;
+/// `TcpListener::bind` e `UdpSocket::bind` se encaixam direto.
+async fn bind_port<T, F, Fut>(state: &State, requested: Option<u16>, bind: F) -> Result<(T, u16)>
+where
+    F: Fn((IpAddr, u16)) -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    if let Some(port) = requested {
+        if !state.port_range.contains(&port) {
+            bail!("porta {port} fora da faixa permitida {:?}", state.port_range);
+        }
+        let t = bind((state.tunnel_ip, port))
+            .await
+            .with_context(|| format!("porta {port} indisponível"))?;
+        return Ok((t, port));
     }
-    Ok((state.tunnel_ip, port))
+    for _ in 0..100 {
+        // `thread_rng()` não é Send: por isso o gerador vive só nesta linha,
+        // nunca atravessa um `.await`.
+        let port = rand::thread_rng().gen_range(state.port_range.clone());
+        if let Ok(t) = bind((state.tunnel_ip, port)).await {
+            return Ok((t, port));
+        }
+    }
+    bail!("nenhuma porta livre na faixa {:?}", state.port_range)
 }
 
 /// Subdomínio vira parte de um nome DNS: só `a-z 0-9 -`, 1 a 63 caracteres,
@@ -307,7 +332,7 @@ fn register_http(
     state: &Arc<State>,
     tx: &mpsc::Sender<ServerMsg>,
     requested: Option<String>,
-) -> Result<(Bound, String)> {
+) -> Result<(Bound, Public)> {
     let Some(cfg) = &state.http else {
         bail!("túneis HTTP desabilitados neste servidor (falta --domain)");
     };
@@ -342,7 +367,7 @@ fn register_http(
         state: state.clone(),
         subdomain: sub,
     };
-    Ok((Bound::Http(guard), url))
+    Ok((Bound::Http(guard), Public::Url(url)))
 }
 
 /// Vive enquanto o cliente estiver conectado.
