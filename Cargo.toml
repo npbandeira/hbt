@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["proto", "server", "client", "e2e"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+hbt-proto = { path = "proto" }
