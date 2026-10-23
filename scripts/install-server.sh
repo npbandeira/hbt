@@ -10,7 +10,9 @@
 #   --control-bind A    porta de controle         (padrão 0.0.0.0:7000)
 #   --port-range A-B    portas públicas tcp/udp   (padrão 20000-30000)
 #
-# É idempotente: rodar de novo atualiza o binário e reinicia, MANTENDO o token.
+# Idempotente: rodar de novo atualiza o binário e reinicia, mantendo os tokens.
+# Os tokens dos clientes ficam em /var/lib/hbt/tokens.json e são gerenciados com
+#   sudo -u hbt hbt-server token create|list|revoke
 # Variável DESTDIR (como em pacotes) instala numa árvore de teste sem tocar no sistema.
 set -euo pipefail
 
@@ -22,7 +24,7 @@ while [[ $# -gt 0 ]]; do
     --http-bind) HTTP_BIND="$2"; shift 2 ;;
     --control-bind) CONTROL_BIND="$2"; shift 2 ;;
     --port-range) RANGE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "opção desconhecida: $1 (veja --help)" >&2; exit 2 ;;
   esac
 done
@@ -46,17 +48,11 @@ fi
 BIN_DST="$DESTDIR/usr/local/bin/hbt-server"
 ENV_DIR="$DESTDIR/etc/hbt"
 ENV_FILE="$ENV_DIR/server.env"
+DATA_DIR="$DESTDIR/var/lib/hbt"
 UNIT="$DESTDIR/etc/systemd/system/hbt-server.service"
 
-# Lê um valor já existente no env (para manter token/domínio em reinstalações).
+# Lê um valor já existente no env (para manter o domínio em reinstalações).
 existing() { [[ -f "$ENV_FILE" ]] && sed -n "s/^$1=//p" "$ENV_FILE" | head -n1 || true; }
-
-TOKEN="$(existing HBT_TOKEN)"
-NEW_TOKEN=0
-if [[ -z "$TOKEN" ]]; then
-  TOKEN="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"   # 256 bits aleatórios
-  NEW_TOKEN=1
-fi
 [[ -n "$DOMAIN" ]] || DOMAIN="$(existing HBT_DOMAIN)"
 
 if [[ -z "$DESTDIR" ]]; then
@@ -67,15 +63,20 @@ fi
 echo "==> binário em $BIN_DST"
 install -D -m 0755 "$BIN" "$BIN_DST"
 
-echo "==> configuração em $ENV_FILE (somente root lê)"
+echo "==> dados em $DATA_DIR (tokens; só o usuário hbt acessa)"
+if [[ -z "$DESTDIR" ]]; then
+  install -d -m 0750 -o hbt -g hbt "$DATA_DIR"
+else
+  install -d -m 0750 "$DATA_DIR"
+fi
+
+echo "==> configuração em $ENV_FILE"
 install -d -m 0755 "$ENV_DIR"
-umask 077   # o arquivo contém o token: nasce privado, sem janela de leitura
 {
-  echo "HBT_TOKEN=$TOKEN"
   [[ -n "$DOMAIN" ]] && echo "HBT_DOMAIN=$DOMAIN"
   echo "HBT_HTTP_BIND=$HTTP_BIND"
+  echo "HBT_DATA_DIR=/var/lib/hbt"
 } > "$ENV_FILE"
-umask 022
 
 echo "==> serviço systemd"
 install -d -m 0755 "$(dirname "$UNIT")"
@@ -89,7 +90,7 @@ Wants=network-online.target
 User=hbt
 Group=hbt
 EnvironmentFile=/etc/hbt/server.env
-ExecStart=/usr/local/bin/hbt-server --control-bind $CONTROL_BIND --port-range $RANGE
+ExecStart=/usr/local/bin/hbt-server serve --control-bind $CONTROL_BIND --port-range $RANGE
 Restart=on-failure
 RestartSec=2
 # Muitos túneis = muitos sockets abertos.
@@ -97,9 +98,10 @@ LimitNOFILE=65536
 # Permite escutar na porta 80 sem rodar como root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# Endurecimento: o serviço só precisa de rede.
+# Endurecimento: o serviço só precisa de rede e do diretório de tokens.
 NoNewPrivileges=yes
 ProtectSystem=strict
+ReadWritePaths=/var/lib/hbt
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -124,9 +126,16 @@ fi
 CPORT="${CONTROL_BIND##*:}"; HPORT="${HTTP_BIND##*:}"
 echo
 echo "hbt-server instalado e rodando."
-[[ -n "$DOMAIN" ]] && echo "  HTTP : *.$DOMAIN -> porta $HPORT (precisa de DNS wildcard *.$DOMAIN -> IP deste servidor)" \
-                  || echo "  HTTP : desabilitado (reinstale com --domain para habilitar 'hbt http')"
-echo "  Token: $TOKEN$([[ $NEW_TOKEN -eq 1 ]] && echo '  (novo)' || echo '  (mantido)')"
+if [[ -n "$DOMAIN" ]]; then
+  echo "  HTTP : *.$DOMAIN -> porta $HPORT (precisa de DNS wildcard *.$DOMAIN -> IP deste servidor)"
+else
+  echo "  HTTP : desabilitado (reinstale com --domain para habilitar 'hbt http')"
+fi
+echo
+echo "Crie um token para cada cliente (mostrado uma única vez):"
+echo "  sudo -u hbt hbt-server token create meu-notebook"
+echo "  sudo -u hbt hbt-server token list"
+echo "  sudo -u hbt hbt-server token revoke meu-notebook"
 echo
 echo "Libere no firewall do VPS (e no painel do provedor):"
 echo "  ${CPORT}/tcp   ${HPORT}/tcp   ${RANGE/-/:}/tcp   ${RANGE/-/:}/udp"

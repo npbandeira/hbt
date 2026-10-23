@@ -115,6 +115,20 @@ UDP não tem conexão; "sessão" = peer público. Cada peer ganha um socket loca
 local: se um peer só envia e o serviço nunca responde, a sessão é recriada
 (porta de origem local muda). Melhoria futura: contar atividade nos dois sentidos.
 
+**Tokens por cliente (`<id>.<segredo>`)**
+O `id` (público) localiza o registro; o `segredo` (256 bits) prova identidade
+via desafio HMAC. O servidor guarda `SHA-256("hbt-token-v1:"+segredo)` e nunca o
+segredo cru; o cliente recalcula a mesma chave. Cada token tem nome, data e
+limites opcionais (portas/subdomínios), e pode ser revogado sozinho: o servidor
+relê o arquivo a cada autenticação e a cada heartbeat, então a revogação derruba
+sessões ativas em até ~10s. Um id desconhecido recebe o desafio como qualquer
+outro e falha com a mesma mensagem (evita descobrir quais ids existem).
+*Limite honesto:* sem TLS, quem copia `tokens.json` tem as chaves e consegue
+responder ao desafio ("pass-the-hash"): guardar a chave derivada só protege de
+verdade quando o canal for TLS e o servidor guardar um hash dela. O formato
+já está pronto para essa migração. Armazenamento em JSON atende dezenas de
+clientes; para muitos milhares, use SQLite.
+
 **Autenticação HMAC sem criptografia**
 Prova que o cliente conhece o segredo e impede replay, mas o tráfego
 trafega em claro entre cliente e servidor, e um atacante no meio da rede

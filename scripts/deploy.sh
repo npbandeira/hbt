@@ -3,7 +3,7 @@
 #   1. compila (se dist/ ainda não existe)
 #   2. envia o binário e o instalador ao VPS por ssh/scp
 #   3. instala o serviço systemd lá
-#   4. traz o token de volta e configura o cliente local
+#   4. cria um token exclusivo para esta máquina e configura o cliente local
 #
 #   ./scripts/deploy.sh usuario@meu.vps --domain tunnel.exemplo.com
 #
@@ -39,11 +39,14 @@ ssh -t -p "$SSH_PORT" "$TARGET" \
   "sudo bash '$REMOTE_DIR/install-server.sh' --bin '$REMOTE_DIR/hbt-server-linux-x86_64-static' ${EXTRA[*]@Q}; rc=\$?; rm -rf '$REMOTE_DIR'; exit \$rc"
 
 if [[ $CONFIGURE -eq 1 ]]; then
-  echo "==> configurando o cliente local"
-  TOKEN="$("${SSH[@]}" "sudo sed -n 's/^HBT_TOKEN=//p' /etc/hbt/server.env")"
-  [[ -n "$TOKEN" ]] || { echo "não consegui ler o token no servidor" >&2; exit 1; }
+  echo "==> criando um token para este computador e configurando o cliente"
+  # Um token por máquina (revogável individualmente), nomeado "usuario@host-data".
+  NAME="$(whoami)@$(hostname -s)-$(date +%Y%m%d%H%M%S)"
+  TOKEN="$("${SSH[@]}" "sudo -u hbt /usr/local/bin/hbt-server token create '$NAME' --quiet")"
+  [[ -n "$TOKEN" ]] || { echo "não consegui criar o token no servidor" >&2; exit 1; }
   [[ -x "$HOME/.local/bin/hbt" ]] || ./scripts/install-client.sh
   HBT_SERVER="$PUBLIC_HOST" HBT_TOKEN="$TOKEN" "$HOME/.local/bin/hbt" configure
   echo
+  echo "Token '$NAME' criado. Para revogar:  ssh $TARGET sudo -u hbt hbt-server token revoke '$NAME'"
   echo "Pronto. Teste:  hbt http 3000"
 fi
