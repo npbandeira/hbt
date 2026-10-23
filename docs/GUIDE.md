@@ -22,11 +22,24 @@ servidor usem o *mesmo* crate de protocolo.
    cliente abre uma conexão nova com `Accept(id)`, servidor cola usuário↔dados.
 3. **Dados UDP** (uma por túnel): carrega todos os datagramas em frames.
 
+### Túneis HTTP (`hbt http 3000`)
+
+Em vez de uma porta pública por túnel, o servidor tem UMA porta de entrada
+HTTP. Para cada conexão ele lê os cabeçalhos, extrai `Host: abc.dominio.com`,
+procura `abc` na tabela de rotas (`subdomínio -> canal do cliente`) e a partir
+daí reaproveita exatamente o mecanismo TCP (`NewConn` + conexão de dados),
+só reenviando antes os bytes já lidos. Se não houver rota: 404; cliente
+offline: 502; cliente não respondeu a tempo: 504.
+
 Por que uma conexão nova por usuário em vez de multiplexar tudo numa só?
 Veja trade-offs abaixo.
 
 ## 2. Glossário
 
+- **Virtual host / `Host` header**: vários sites no mesmo IP:porta; o
+  cliente diz em `Host:` qual quer. É assim que `a.x.com` e `b.x.com` chegam
+  a túneis diferentes. Exige DNS wildcard (`*.x.com`).
+- **Edge**: a "borda" pública que recebe o tráfego da internet e o encaminha.
 - **Reverse tunnel**: o serviço fica "atrás"; o cliente faz conexão de *saída*
   até o servidor público, que então encaminha tráfego de volta por ela.
   NAT e firewalls costumam bloquear entrada, não saída.
@@ -115,6 +128,27 @@ próximo passo natural.
 bincode é compacto e rápido, mas ilegível e sem versionamento. JSON é
 depurável a olho, porém maior e mais lento; para datagramas UDP em array de
 bytes seria bem pior. Em protocolo público considere um campo de versão.
+
+**Rotear HTTP por conexão (L4) vs. por requisição (L7)**
+Lemos só a primeira requisição para escolher o túnel e depois copiamos bytes
+(camada 4). Vantagem: WebSocket, SSE, uploads gigantes e HTTP/1.1 keep-alive
+funcionam sem tratamento especial, e não há parsing de corpo (superfície de
+ataque menor). Custo: não adicionamos `X-Forwarded-For`, não temos inspeção/
+replay de requisições como o painel do ngrok, e uma conexão que misture
+`Host`s diferentes seria roteada só pelo primeiro. Um proxy L7 completo
+(hyper) resolve isso a custo de bem mais código.
+
+**HTTPS**
+O edge fala HTTP puro. Terminar TLS aqui exigiria certificados wildcard
+(ACME DNS-01) e `rustls`: ótimo exercício futuro. Hoje a recomendação é
+deixar Caddy/nginx com o certificado na frente: separa responsabilidades e
+usa software maduro para renovar certificados.
+
+**Subdomínios**
+Sorteados (32 bits aleatórios) ou pedidos pelo cliente, validados como label DNS.
+Com token compartilhado, qualquer cliente pode pegar qualquer subdomínio livre
+(quem chega primeiro leva) e a checagem+inserção acontece sob o mesmo lock para
+evitar condição de corrida.
 
 **Um túnel por processo `hbt`**
 Simples e isolado (uma falha não derruba as outras). Custo: uma conexão de

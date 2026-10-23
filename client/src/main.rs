@@ -42,20 +42,67 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Expõe um serviço TCP local (ssh, http, ...).
-    Tcp(Tunnel),
-    /// Expõe um serviço UDP local (wireguard, dns, jogos, ...).
-    Udp(Tunnel),
+    /// Expõe um servidor web local numa URL pública (como `ngrok http 80`).
+    Http(HttpArgs),
+    /// Expõe um serviço TCP local numa porta pública (ssh, bancos, ...).
+    Tcp(PortArgs),
+    /// Expõe um serviço UDP local numa porta pública (wireguard, dns, ...).
+    Udp(PortArgs),
 }
 
-#[derive(ClapArgs, Clone)]
-struct Tunnel {
+#[derive(ClapArgs)]
+struct HttpArgs {
+    /// O que expor: só a porta (`80`, vira 127.0.0.1:80) ou `host:porta`.
+    target: String,
+    /// Subdomínio desejado (padrão: sorteado pelo servidor).
+    #[arg(long)]
+    subdomain: Option<String>,
+}
+
+#[derive(ClapArgs)]
+struct PortArgs {
     /// Serviço local a expor, ex: 127.0.0.1:22
     #[arg(long)]
     local: String,
     /// Porta que será aberta no servidor.
     #[arg(long)]
     remote_port: u16,
+}
+
+/// O que o usuário pediu, já traduzido: o que registrar e para onde encaminhar.
+struct Plan {
+    spec: TunnelSpec,
+    local: String,
+}
+
+impl From<&Cmd> for Plan {
+    fn from(cmd: &Cmd) -> Self {
+        match cmd {
+            Cmd::Http(a) => Plan {
+                spec: TunnelSpec::Http {
+                    subdomain: a.subdomain.clone(),
+                },
+                // `hbt http 80` => 127.0.0.1:80. Só dígitos = porta.
+                local: if a.target.bytes().all(|b| b.is_ascii_digit()) {
+                    format!("127.0.0.1:{}", a.target)
+                } else {
+                    a.target.clone()
+                },
+            },
+            Cmd::Tcp(a) => Plan {
+                spec: TunnelSpec::Tcp {
+                    remote_port: a.remote_port,
+                },
+                local: a.local.clone(),
+            },
+            Cmd::Udp(a) => Plan {
+                spec: TunnelSpec::Udp {
+                    remote_port: a.remote_port,
+                },
+                local: a.local.clone(),
+            },
+        }
+    }
 }
 
 /// Erro que não adianta tentar de novo (ex.: token errado).
@@ -77,15 +124,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let (proto, tunnel) = match &cli.cmd {
-        Cmd::Tcp(t) => (Proto::Tcp, t.clone()),
-        Cmd::Udp(t) => (Proto::Udp, t.clone()),
-    };
+    let plan = Plan::from(&cli.cmd);
 
     // Ctrl-C encerra limpo. `select!` roda os dois futures e termina quando
     // o PRIMEIRO completar, descartando o outro.
     tokio::select! {
-        r = reconnect_loop(&cli, proto, &tunnel) => r,
+        r = reconnect_loop(&cli, &plan) => r,
         _ = tokio::signal::ctrl_c() => { info!("encerrando"); Ok(()) }
     }
 }
@@ -93,11 +137,11 @@ async fn main() -> Result<()> {
 /// Reconecta para sempre com *exponential backoff*: espera 1s, 2s, 4s... até
 /// 30s entre tentativas. Sem isso, um servidor fora do ar seria martelado em
 /// loop apertado (e vários clientes juntos fariam um "thundering herd").
-async fn reconnect_loop(cli: &Cli, proto: Proto, t: &Tunnel) -> Result<()> {
+async fn reconnect_loop(cli: &Cli, plan: &Plan) -> Result<()> {
     let mut delay = Duration::from_secs(1);
     loop {
         let mut registered = false;
-        match run_session(cli, proto, t, &mut registered).await {
+        match run_session(cli, plan, &mut registered).await {
             Ok(()) => warn!("sessão terminou"),
             Err(e) => {
                 // `downcast_ref` recupera o tipo concreto escondido no anyhow::Error.
@@ -117,7 +161,7 @@ async fn reconnect_loop(cli: &Cli, proto: Proto, t: &Tunnel) -> Result<()> {
     }
 }
 
-async fn run_session(cli: &Cli, proto: Proto, t: &Tunnel, registered: &mut bool) -> Result<()> {
+async fn run_session(cli: &Cli, plan: &Plan, registered: &mut bool) -> Result<()> {
     let mut ctl = TcpStream::connect(&cli.server)
         .await
         .with_context(|| format!("conectando em {}", cli.server))?;
@@ -140,20 +184,21 @@ async fn run_session(cli: &Cli, proto: Proto, t: &Tunnel, registered: &mut bool)
         _ => bail!("resposta inesperada à autenticação"),
     }
 
-    write_msg(
-        &mut ctl,
-        &ClientMsg::Register {
-            proto,
-            remote_port: t.remote_port,
-        },
-    )
-    .await?;
+    write_msg(&mut ctl, &ClientMsg::Register(plan.spec.clone())).await?;
     match timeout(Duration::from_secs(5), read_msg(&mut ctl))
         .await
         .context("timeout")??
     {
-        ServerMsg::Registered { remote_port } => {
-            info!("túnel {proto:?} ativo: <servidor>:{remote_port} -> {}", t.local);
+        ServerMsg::Registered { public } => {
+            // Para HTTP `public` já é a URL; para TCP/UDP é "porta N" no host do servidor.
+            let host = cli
+                .server
+                .rsplit_once(':')
+                .map_or(cli.server.as_str(), |(h, _)| h);
+            match plan.spec {
+                TunnelSpec::Http { .. } => info!("Forwarding {public} -> http://{}", plan.local),
+                _ => info!("Forwarding {host} {public} -> {}", plan.local),
+            }
             *registered = true;
         }
         // Pode ser transitório (servidor ainda não notou que a sessão antiga
@@ -187,7 +232,7 @@ async fn run_session(cli: &Cli, proto: Proto, t: &Tunnel, registered: &mut bool)
             .context("servidor sem heartbeat")??;
         match msg {
             ServerMsg::NewConn(id) => {
-                let (server, local) = (cli.server.clone(), t.local.clone());
+                let (server, local) = (cli.server.clone(), plan.local.clone());
                 tokio::spawn(async move {
                     if let Err(e) = tcp_data(server, id, local).await {
                         debug!("conexão TCP: {e:#}");
@@ -195,7 +240,7 @@ async fn run_session(cli: &Cli, proto: Proto, t: &Tunnel, registered: &mut bool)
                 });
             }
             ServerMsg::NewUdpStream(id) => {
-                let (server, local) = (cli.server.clone(), t.local.clone());
+                let (server, local) = (cli.server.clone(), plan.local.clone());
                 tokio::spawn(async move {
                     if let Err(e) = udp_data(server, id, local).await {
                         debug!("stream UDP: {e:#}");

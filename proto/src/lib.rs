@@ -28,10 +28,22 @@ pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// você recebeu o id pelo canal de controle já autenticado).
 pub type ConnId = u128;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Proto {
-    Tcp,
-    Udp,
+/// O que o cliente quer expor. Cada variante carrega só os campos que fazem
+/// sentido para ela: o tipo torna impossível, por exemplo, pedir um
+/// subdomínio num túnel UDP (em vez de um campo opcional ignorado).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TunnelSpec {
+    Tcp {
+        remote_port: u16,
+    },
+    Udp {
+        remote_port: u16,
+    },
+    /// Túnel HTTP: o servidor roteia por `Host: <subdomínio>.<domínio>`.
+    /// `None` = servidor sorteia um subdomínio.
+    Http {
+        subdomain: Option<String>,
+    },
 }
 
 /// Primeira mensagem de TODA conexão que chega na porta de controle.
@@ -50,8 +62,9 @@ pub enum Hello {
 pub enum ServerMsg {
     Challenge([u8; 32]),
     AuthOk,
+    /// `public` é o endereço para mostrar ao usuário (ex.: `http://abc.exemplo.com`).
     Registered {
-        remote_port: u16,
+        public: String,
     },
     /// Chegou um usuário público (TCP): abra uma conexão de dados com este id.
     NewConn(ConnId),
@@ -65,7 +78,7 @@ pub enum ServerMsg {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     Auth(Vec<u8>),
-    Register { proto: Proto, remote_port: u16 },
+    Register(TunnelSpec),
     Heartbeat,
 }
 

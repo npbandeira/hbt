@@ -1,6 +1,9 @@
 //! hbt-server: roda na nuvem (IP público). Aceita clientes na porta de
 //! controle e abre portas públicas que redirecionam o tráfego pelo túnel.
 //!
+//! Três tipos de túnel: TCP e UDP (porta pública dedicada) e HTTP (uma porta
+//! de entrada compartilhada; o `Host` da requisição escolhe o túnel).
+//!
 //! Fluxo TCP (resumo; detalhes em docs/GUIDE.md):
 //!
 //!   usuário --> [porta pública no servidor]
@@ -21,7 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hbt_proto::*;
-use tokio::io::{copy_bidirectional, BufReader};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout};
@@ -41,6 +44,16 @@ struct Args {
     /// Faixa de portas que clientes podem pedir, ex: 20000-30000.
     #[arg(long, default_value = "20000-30000", value_parser = parse_range)]
     port_range: RangeInclusive<u16>,
+
+    /// Domínio base dos túneis HTTP: `abc.<domain>` vai para o túnel `abc`.
+    /// Sem isso, túneis HTTP ficam desabilitados.
+    #[arg(long)]
+    domain: Option<String>,
+
+    /// Onde escutar requisições HTTP públicas (usado com --domain). Para
+    /// HTTPS, ponha um proxy com TLS (Caddy/nginx) na frente deste endereço.
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    http_bind: String,
 
     /// Segredo compartilhado. Prefira a variável de ambiente: argumentos de
     /// linha de comando aparecem para outros usuários em `ps`.
@@ -71,6 +84,11 @@ struct State {
     token: String,
     tunnel_ip: IpAddr,
     port_range: RangeInclusive<u16>,
+    /// Configuração do edge HTTP (None = desabilitado).
+    http: Option<HttpCfg>,
+    /// subdomínio -> canal de controle do cliente dono dele. O edge HTTP usa
+    /// isto para pedir "abra uma conexão de dados" ao cliente certo.
+    routes: Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>,
     /// Conexões públicas esperando o cliente "devolver" o lado de dados.
     ///
     /// `std::sync::Mutex` e não `tokio::sync::Mutex`: a seção crítica é só
@@ -80,6 +98,24 @@ struct State {
     /// guard de std Mutex não é `Send`, então segurá-lo num await dentro de
     /// um `spawn` dá erro de compilação.
     pending: Mutex<HashMap<ConnId, oneshot::Sender<TcpStream>>>,
+}
+
+struct HttpCfg {
+    domain: String,
+    /// Porta pública do edge, só para montar a URL mostrada ao usuário.
+    port: u16,
+}
+
+/// Remove a rota HTTP quando o túnel acaba (RAII, como `AbortOnDrop`).
+struct RouteGuard {
+    state: Arc<State>,
+    subdomain: String,
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.state.routes.lock().unwrap().remove(&self.subdomain);
+    }
 }
 
 impl State {
@@ -106,10 +142,29 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    let http_listener = match args.domain {
+        Some(_) => Some(
+            TcpListener::bind(&args.http_bind)
+                .await
+                .with_context(|| format!("não consegui abrir {}", args.http_bind))?,
+        ),
+        None => None,
+    };
+    let http = match (&args.domain, &http_listener) {
+        (Some(domain), Some(l)) => Some(HttpCfg {
+            domain: domain.to_ascii_lowercase(),
+            port: l.local_addr()?.port(),
+        }),
+        _ => None,
+    };
+
     let state = Arc::new(State {
         token: args.token,
         tunnel_ip: args.tunnel_ip,
         port_range: args.port_range,
+        http,
+        routes: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
     });
 
@@ -120,6 +175,15 @@ async fn main() -> Result<()> {
         "controle em {} | portas públicas {:?}",
         args.control_bind, state.port_range
     );
+
+    if let Some(l) = http_listener {
+        info!(
+            "HTTP em {} | *.{}",
+            args.http_bind,
+            state.http.as_ref().unwrap().domain
+        );
+        tokio::spawn(http_edge(l, state.clone()));
+    }
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -159,8 +223,9 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
         }
         Hello::Control => {
             // Qualquer erro antes de "Registered" é reportado ao cliente.
-            match timeout(Duration::from_secs(5), negotiate(&mut stream, &state)).await {
-                Ok(Ok(bound)) => run_tunnel(stream, state, bound).await,
+            let (tx, rx) = mpsc::channel::<ServerMsg>(64);
+            match timeout(Duration::from_secs(5), negotiate(&mut stream, &state, &tx)).await {
+                Ok(Ok(bound)) => run_tunnel(stream, state, bound, tx, rx).await,
                 Ok(Err(e)) => {
                     let _ = write_msg(&mut stream, &ServerMsg::Error(e.to_string())).await;
                     Err(e)
@@ -175,10 +240,16 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
 enum Bound {
     Tcp(TcpListener),
     Udp(UdpSocket),
+    /// Sem socket próprio: só mantém a rota registrada enquanto viver.
+    Http(RouteGuard),
 }
 
 /// Autentica o cliente e abre a porta pública pedida.
-async fn negotiate(stream: &mut TcpStream, state: &State) -> Result<Bound> {
+async fn negotiate(
+    stream: &mut TcpStream,
+    state: &Arc<State>,
+    tx: &mpsc::Sender<ServerMsg>,
+) -> Result<Bound> {
     let nonce: [u8; 32] = rand::random();
     write_msg(stream, &ServerMsg::Challenge(nonce)).await?;
 
@@ -190,35 +261,105 @@ async fn negotiate(stream: &mut TcpStream, state: &State) -> Result<Bound> {
     }
     write_msg(stream, &ServerMsg::AuthOk).await?;
 
-    let ClientMsg::Register { proto, remote_port } = read_msg(stream).await? else {
+    let ClientMsg::Register(spec) = read_msg(stream).await? else {
         bail!("esperava Register");
     };
-    if !state.port_range.contains(&remote_port) {
-        bail!(
-            "porta {remote_port} fora da faixa permitida {:?}",
-            state.port_range
-        );
-    }
-
-    let addr = (state.tunnel_ip, remote_port);
-    let bound = match proto {
-        Proto::Tcp => Bound::Tcp(TcpListener::bind(addr).await.context("porta TCP indisponível")?),
-        Proto::Udp => Bound::Udp(UdpSocket::bind(addr).await.context("porta UDP indisponível")?),
+    info!("registro: {spec:?}");
+    let (bound, public) = match spec {
+        TunnelSpec::Tcp { remote_port } => {
+            let addr = allowed_addr(state, remote_port)?;
+            let l = TcpListener::bind(addr).await.context("porta TCP indisponível")?;
+            (Bound::Tcp(l), format!("porta {remote_port}"))
+        }
+        TunnelSpec::Udp { remote_port } => {
+            let addr = allowed_addr(state, remote_port)?;
+            let s = UdpSocket::bind(addr).await.context("porta UDP indisponível")?;
+            (Bound::Udp(s), format!("porta {remote_port}"))
+        }
+        TunnelSpec::Http { subdomain } => register_http(state, tx, subdomain)?,
     };
-    write_msg(stream, &ServerMsg::Registered { remote_port }).await?;
-    info!("túnel {proto:?} aberto na porta {remote_port}");
+    write_msg(stream, &ServerMsg::Registered { public }).await?;
     Ok(bound)
 }
 
+fn allowed_addr(state: &State, port: u16) -> Result<(IpAddr, u16)> {
+    if !state.port_range.contains(&port) {
+        bail!("porta {port} fora da faixa permitida {:?}", state.port_range);
+    }
+    Ok((state.tunnel_ip, port))
+}
+
+/// Subdomínio vira parte de um nome DNS: só `a-z 0-9 -`, 1 a 63 caracteres,
+/// sem hífen nas pontas (regra de "label" DNS).
+fn validate_subdomain(s: &str) -> Result<()> {
+    let ok = (1..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-');
+    if !ok {
+        bail!("subdomínio inválido (use a-z, 0-9 e '-', até 63 caracteres)");
+    }
+    Ok(())
+}
+
+fn register_http(
+    state: &Arc<State>,
+    tx: &mpsc::Sender<ServerMsg>,
+    requested: Option<String>,
+) -> Result<(Bound, String)> {
+    let Some(cfg) = &state.http else {
+        bail!("túneis HTTP desabilitados neste servidor (falta --domain)");
+    };
+    if let Some(s) = &requested {
+        validate_subdomain(s)?;
+    }
+    // Checar e inserir sob o MESMO lock: senão dois clientes poderiam
+    // checar "livre" ao mesmo tempo e ambos registrar (race condition).
+    let mut routes = state.routes.lock().unwrap();
+    let sub = match requested {
+        Some(s) => s,
+        None => loop {
+            let candidate = format!("{:08x}", rand::random::<u32>());
+            if !routes.contains_key(&candidate) {
+                break candidate;
+            }
+        },
+    };
+    if routes.contains_key(&sub) {
+        bail!("subdomínio '{sub}' já está em uso");
+    }
+    routes.insert(sub.clone(), tx.clone());
+    drop(routes);
+
+    let port = if cfg.port == 80 {
+        String::new()
+    } else {
+        format!(":{}", cfg.port)
+    };
+    let url = format!("http://{sub}.{}{port}", cfg.domain);
+    let guard = RouteGuard {
+        state: state.clone(),
+        subdomain: sub,
+    };
+    Ok((Bound::Http(guard), url))
+}
+
 /// Vive enquanto o cliente estiver conectado.
-async fn run_tunnel(stream: TcpStream, state: Arc<State>, bound: Bound) -> Result<()> {
+async fn run_tunnel(
+    stream: TcpStream,
+    state: Arc<State>,
+    bound: Bound,
+    tx: mpsc::Sender<ServerMsg>,
+    mut rx: mpsc::Receiver<ServerMsg>,
+) -> Result<()> {
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
 
-    // Vários produtores (listener TCP / pump UDP) -> um único consumidor
-    // (este loop, dono da escrita no socket de controle). `mpsc` = multi
-    // producer, single consumer. Evita dois tasks escrevendo ao mesmo tempo.
-    let (tx, mut rx) = mpsc::channel::<ServerMsg>(64);
+    // `rx` é o único consumidor (este loop, dono da escrita no socket de
+    // controle); produtores: listener TCP, pump UDP ou o edge HTTP (via
+    // `routes`). `mpsc` = multi producer, single consumer: evita dois tasks
+    // escrevendo ao mesmo tempo no mesmo socket.
 
     // Leitura do canal de controle vive em task próprio porque `read_msg`
     // não é cancel-safe (veja proto/src/lib.rs): não pode concorrer num
@@ -233,10 +374,14 @@ async fn run_tunnel(stream: TcpStream, state: Arc<State>, bound: Bound) -> Resul
         }
     }));
 
-    let mut tunnel = AbortOnDrop(match bound {
-        Bound::Tcp(listener) => tokio::spawn(tcp_accept_loop(listener, state, tx.clone())),
-        Bound::Udp(socket) => tokio::spawn(udp_tunnel(socket, state, tx.clone())),
-    });
+    // Túneis TCP/UDP têm um task; HTTP só uma rota (guard) que vive até o fim.
+    let mut tunnel = None;
+    let mut _route = None; // com nome: o guard só cai quando a função termina
+    match bound {
+        Bound::Tcp(l) => tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(l, state, tx)))),
+        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state, tx)))),
+        Bound::Http(guard) => _route = Some(guard),
+    }
 
     let mut beat = interval(HEARTBEAT_EVERY);
     loop {
@@ -244,13 +389,23 @@ async fn run_tunnel(stream: TcpStream, state: Arc<State>, bound: Bound) -> Resul
             Some(msg) = rx.recv() => write_msg(&mut wr, &msg).await?,
             _ = beat.tick() => write_msg(&mut wr, &ServerMsg::Heartbeat).await?,
             _ = &mut reader.0 => break,
-            _ = &mut tunnel.0 => break,
+            _ = tunnel_done(&mut tunnel) => break,
         }
     }
     info!("túnel encerrado");
     // Ao sair, `reader` e `tunnel` sofrem Drop => tasks abortados => o
     // listener é fechado e a porta pública liberada. Isso é RAII.
     Ok(())
+}
+
+/// Completa quando o task do túnel termina; para HTTP (sem task) nunca completa.
+async fn tunnel_done(tunnel: &mut Option<AbortOnDrop>) {
+    match tunnel {
+        Some(t) => {
+            let _ = (&mut t.0).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, tx: mpsc::Sender<ServerMsg>) {
@@ -337,4 +492,134 @@ async fn stream_to_udp(
         let f: UdpFrame = read_msg(&mut rd).await?;
         socket.send_to(&f.data, f.peer).await?;
     }
+}
+
+// ------------------------------------------------------------ edge HTTP
+
+/// Tamanho máximo da linha de requisição + cabeçalhos que aceitamos ler.
+const MAX_HEAD: usize = 16 * 1024;
+
+async fn http_edge(listener: TcpListener, state: Arc<State>) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("accept http falhou: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_http(stream, state).await {
+                debug!("http {peer}: {e:#}");
+            }
+        });
+    }
+}
+
+/// Lê os cabeçalhos para descobrir o `Host`, escolhe o túnel e depois vira
+/// um simples "cano" TCP: reenviamos os bytes já lidos e copiamos o resto.
+///
+/// Trade-off: roteamos por CONEXÃO, olhando só a primeira requisição. Não
+/// reescrevemos nem inspecionamos requisições seguintes (keep-alive). Navegadores
+/// usam uma conexão por origem, então funciona; um proxy que misture vários
+/// hosts numa conexão só seria roteado pelo primeiro. Em troca, WebSocket,
+/// streaming e uploads grandes funcionam sem esforço (não parseamos corpos).
+async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
+    let (head, host) = match timeout(Duration::from_secs(10), read_http_head(&mut public)).await {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            respond(&mut public, "400 Bad Request", "requisição HTTP inválida").await;
+            return Err(e);
+        }
+        Err(_) => bail!("timeout lendo cabeçalhos"),
+    };
+
+    let route = subdomain_of(&state, &host).and_then(|sub| state.routes.lock().unwrap().get(&sub).cloned());
+    let Some(route) = route else {
+        respond(
+            &mut public,
+            "404 Not Found",
+            &format!("nenhum túnel para '{host}'"),
+        )
+        .await;
+        return Ok(());
+    };
+
+    let (id, rx) = state.expect_conn();
+    if route.send(ServerMsg::NewConn(id)).await.is_err() {
+        state.forget(id);
+        respond(&mut public, "502 Bad Gateway", "túnel offline").await;
+        return Ok(());
+    }
+    match timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(mut data)) => {
+            data.write_all(&head).await?; // replay do que já consumimos
+            copy_bidirectional(&mut public, &mut data).await?;
+        }
+        _ => {
+            state.forget(id);
+            respond(
+                &mut public,
+                "504 Gateway Timeout",
+                "o cliente do túnel não respondeu",
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// `Abc.exemplo.com:8080` -> `abc` (se o domínio base bater e for 1 nível só).
+fn subdomain_of(state: &State, host: &str) -> Option<String> {
+    let cfg = state.http.as_ref()?;
+    let host = host.to_ascii_lowercase();
+    // Tira ":porta" (só se o que vem depois dos ':' for número).
+    let name = match host.rsplit_once(':') {
+        Some((n, port)) if port.bytes().all(|b| b.is_ascii_digit()) => n,
+        _ => host.as_str(),
+    };
+    let sub = name.strip_suffix(&format!(".{}", cfg.domain))?;
+    (!sub.contains('.')).then(|| sub.to_owned())
+}
+
+/// Acumula bytes até os cabeçalhos HTTP/1.x estarem completos e devolve
+/// (bytes lidos, valor do Host). `httparse` é o mesmo parser usado pelo hyper:
+/// parsear HTTP à mão é fonte clássica de bugs de segurança (request smuggling).
+async fn read_http_head(s: &mut TcpStream) -> Result<(Vec<u8>, String)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+    loop {
+        let n = s.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("conexão fechada antes dos cabeçalhos");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(&buf)? {
+            httparse::Status::Complete(_) => {
+                let host = req
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("host"))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .map(str::to_owned)
+                    .context("sem cabeçalho Host")?;
+                return Ok((buf, host));
+            }
+            httparse::Status::Partial if buf.len() >= MAX_HEAD => bail!("cabeçalhos grandes demais"),
+            httparse::Status::Partial => {}
+        }
+    }
+}
+
+async fn respond(s: &mut TcpStream, status: &str, body: &str) {
+    let msg = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}\n",
+        body.len() + 1
+    );
+    let _ = s.write_all(msg.as_bytes()).await;
 }

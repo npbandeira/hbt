@@ -204,3 +204,114 @@ async fn port_outside_range_is_refused() {
         "porta fora da faixa não deveria abrir"
     );
 }
+
+/// Servidor HTTP mínimo: responde "ok" a qualquer requisição.
+async fn http_ok_server() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+/// Faz um GET cru para o edge HTTP com o `Host` dado e devolve a resposta inteira.
+async fn http_get(edge: u16, host: &str) -> String {
+    // Servidor ainda subindo: devolve vazio e quem chama tenta de novo.
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", edge)).await else {
+        return String::new();
+    };
+    let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    timeout(Duration::from_secs(5), s.read_to_string(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    out
+}
+
+#[tokio::test]
+async fn http_tunnel_routes_by_host_header() {
+    let (control, public, edge) = (free_port(), free_port(), free_port());
+    let (c, r, h) = (
+        format!("127.0.0.1:{control}"),
+        format!("{public}-{public}"),
+        format!("127.0.0.1:{edge}"),
+    );
+    let _server = spawn(
+        "hbt-server",
+        &[
+            "--control-bind",
+            &c,
+            "--tunnel-ip",
+            "127.0.0.1",
+            "--port-range",
+            &r,
+            "--domain",
+            "localhost",
+            "--http-bind",
+            &h,
+        ],
+        TOKEN,
+    );
+    let web = http_ok_server().await;
+    let web_s = web.to_string();
+    let _client = spawn(
+        "hbt",
+        &["--server", &c, "http", &web_s, "--subdomain", "demo"],
+        TOKEN,
+    );
+
+    // Espera o túnel ficar de pé (com e sem :porta no Host, ambos devem rotear).
+    let host = format!("demo.localhost:{edge}");
+    let mut resp = String::new();
+    for _ in 0..50 {
+        resp = http_get(edge, &host).await;
+        if resp.contains("200 OK") {
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK") && resp.ends_with("ok"),
+        "resposta: {resp:?}"
+    );
+    assert!(
+        http_get(edge, "DEMO.localhost").await.contains("200 OK"),
+        "Host deve ser case-insensitive"
+    );
+
+    // Subdomínio sem túnel e domínio errado => 404.
+    assert!(http_get(edge, "outro.localhost")
+        .await
+        .starts_with("HTTP/1.1 404"));
+    assert!(http_get(edge, "demo.exemplo.com")
+        .await
+        .starts_with("HTTP/1.1 404"));
+}
+
+#[tokio::test]
+async fn http_is_refused_when_server_has_no_domain() {
+    let (control, public) = (free_port(), free_port());
+    let _server = start_server(control, &format!("{public}-{public}"));
+    let c = format!("127.0.0.1:{control}");
+    let mut client = spawn("hbt", &["--server", &c, "http", "1"], TOKEN);
+    // Recusa é não-fatal (o cliente tenta de novo), então ele NÃO deve sair sozinho.
+    assert!(timeout(Duration::from_secs(2), client.wait()).await.is_err());
+}

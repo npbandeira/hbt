@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 hbt-proto.workspace = true
+httparse = "1"
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
