@@ -1,0 +1,78 @@
+# Release: ao enviar uma tag vX.Y.Z, compila os binários e publica o release.
+#   git tag v0.1.0 && git push origin v0.1.0
+# A tag precisa bater com a versão dos crates (Cargo.toml).
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag == versão do Cargo.toml
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for c in server client; do
+            got=$(sed -n 's/^version = "\(.*\)"/\1/p' "$c/Cargo.toml" | head -n1)
+            [ "$got" = "$want" ] || { echo "::error::$c/Cargo.toml tem $got, a tag é $GITHUB_REF_NAME"; exit 1; }
+          done
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: binários estáticos (musl), rodam em qualquer distribuição.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-x86_64, server: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-aarch64, server: true }
+          # macOS e Windows: só o cliente (o servidor é feito para Linux/systemd).
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-aarch64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: macos-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-x86_64, exe: .exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: compilar
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          target: ${{ matrix.target }}
+          args: "--locked --release -p hbt ${{ matrix.server && '-p hbt-server' || '' }}"
+          strip: true
+      - name: renomear
+        shell: bash
+        run: |
+          mkdir -p out
+          d="target/${{ matrix.target }}/release"
+          cp "$d/hbt${{ matrix.exe }}" "out/hbt-${{ matrix.name }}${{ matrix.exe }}"
+          if [ "${{ matrix.server }}" = "true" ]; then
+            cp "$d/hbt-server" "out/hbt-server-${{ matrix.name }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: out/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: scripts e checksums
+        run: |
+          cp scripts/install.sh scripts/install-server.sh dist/
+          cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "hbt $GITHUB_REF_NAME" "$@"

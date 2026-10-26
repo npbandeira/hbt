@@ -7,7 +7,25 @@ de um servidor na nuvem. Quem inicia todas as conexões é o **cliente**.
  usuário ──► [VPS: porta 2222] ◄══ túnel ══ [hbt cliente] ──► 127.0.0.1:22
 ```
 
-## Instalação rápida (scripts)
+## Instalação (release)
+
+```sh
+# cliente (Linux/macOS) em ~/.local/bin
+curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh
+hbt configure --server SEU.VPS --token ID.SEGREDO
+
+# servidor (Linux + systemd, no VPS)
+curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh -s -- --server --domain tunnel.exemplo.com
+```
+
+O `install.sh` detecta sistema e arquitetura, confere o SHA-256 e, se o
+repositório for privado, baixa pelo `gh` autenticado. No Windows, baixe
+`hbt-windows-x86_64.exe` da [página de releases](https://github.com/npbandeira/hbt/releases).
+Para publicar uma versão: suba a versão nos `Cargo.toml`, escreva
+`docs/releases/vX.Y.Z.md` e envie a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`);
+o workflow `release` compila e publica.
+
+## Instalação a partir do código (scripts)
 
 ```sh
 ./scripts/build.sh                                    # testes + binários em dist/

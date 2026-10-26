@@ -37,7 +37,9 @@ DESTDIR="${DESTDIR:-}"
 if [[ -z "$DESTDIR" && $EUID -ne 0 ]]; then
   exec sudo -E bash "$0" "$@"          # reexecuta como root
 fi
-[[ "$(uname -m)" == x86_64 || -n "$DESTDIR" ]] || die "binário estático é x86_64; esta máquina é $(uname -m)"
+# Sem --bin procuramos o binário x86_64 do dist/; com --bin, quem chamou (ex.:
+# install.sh) já escolheu o da arquitetura certa.
+[[ -n "$BIN" || "$(uname -m)" == x86_64 || -n "$DESTDIR" ]] || die "binário estático é x86_64; esta máquina é $(uname -m) (use --bin)"
 
 if [[ -z "$BIN" ]]; then
   here="$(cd "$(dirname "$0")" && pwd)"
