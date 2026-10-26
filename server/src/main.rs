@@ -21,13 +21,15 @@ use std::net::IpAddr;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+mod metrics;
 mod tokens;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hbt_proto::*;
+use metrics::{ConnError, Kind, Metrics};
 use rand::Rng;
 use tokens::{TokenRecord, TokenStore};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -104,6 +106,11 @@ struct ServeArgs {
     /// proxy com TLS (Caddy/nginx) na frente e use p.ex. 127.0.0.1:8080.
     #[arg(long, env = "HBT_HTTP_BIND", default_value = "0.0.0.0:80")]
     http_bind: String,
+
+    /// Onde servir métricas Prometheus (`GET /metrics`), ex: 127.0.0.1:9477.
+    /// Sem isso, desligado. Não há autenticação: não exponha à internet.
+    #[arg(long, env = "HBT_METRICS_BIND")]
+    metrics_bind: Option<String>,
 }
 
 fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {
@@ -169,6 +176,7 @@ struct State {
     /// guard de std Mutex não é `Send`, então segurá-lo num await dentro de
     /// um `spawn` dá erro de compilação.
     pending: Mutex<HashMap<ConnId, oneshot::Sender<TcpStream>>>,
+    metrics: Arc<Metrics>,
 }
 
 struct HttpCfg {
@@ -244,6 +252,7 @@ async fn serve(args: ServeArgs, tokens: TokenStore) -> Result<()> {
         http,
         routes: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
+        metrics: Arc::default(),
     });
 
     let listener = TcpListener::bind(&args.control_bind)
@@ -259,6 +268,14 @@ async fn serve(args: ServeArgs, tokens: TokenStore) -> Result<()> {
             "nenhum token cadastrado: ninguém consegue conectar. Crie com: hbt-server token create <nome>"
         ),
         Ok(_) => {}
+    }
+
+    if let Some(bind) = &args.metrics_bind {
+        let l = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("não consegui abrir {bind}"))?;
+        info!("métricas em http://{bind}/metrics");
+        tokio::spawn(metrics::serve(l, state.metrics.clone()));
     }
 
     if let Some(l) = http_listener {
@@ -318,10 +335,14 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
             {
                 Ok(Ok((bound, rec))) => run_tunnel(stream, state, bound, rec, tx, rx).await,
                 Ok(Err(e)) => {
+                    state.metrics.handshake_failed();
                     let _ = write_msg(&mut stream, &ServerMsg::Error(e.to_string())).await;
                     Err(e)
                 }
-                Err(_) => bail!("timeout no handshake"),
+                Err(_) => {
+                    state.metrics.handshake_failed();
+                    bail!("timeout no handshake")
+                }
             }
         }
     }
@@ -359,6 +380,7 @@ async fn negotiate(
     };
     let valid = verify_auth(&key, &nonce, &mac);
     let Some(record) = record.filter(|_| valid) else {
+        state.metrics.auth_failed();
         bail!("autenticação falhou");
     };
     write_msg(stream, &ServerMsg::AuthOk).await?;
@@ -528,6 +550,12 @@ async fn run_tunnel(
         }
     }));
 
+    let _session = state.metrics.session(match bound {
+        Bound::Tcp(_) => Kind::Tcp,
+        Bound::Udp(_) => Kind::Udp,
+        Bound::Http(_) => Kind::Http,
+    });
+
     // Túneis TCP/UDP têm um task; HTTP só uma rota (guard) que vive até o fim.
     let mut tunnel = None;
     let mut _route = None; // com nome: o guard só cai quando a função termina
@@ -587,17 +615,24 @@ async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, tx: mpsc::Sen
             return; // canal de controle morreu
         }
         let state = state.clone();
+        let asked = Instant::now();
         tokio::spawn(async move {
+            let _conn = state.metrics.conn(Kind::Tcp);
             // Dá 10s para o cliente abrir a conexão de dados.
             match timeout(Duration::from_secs(10), rx).await {
                 Ok(Ok(mut data)) => {
+                    state.metrics.data_wait(asked.elapsed());
                     // Copia nos dois sentidos até um lado fechar.
                     match copy_bidirectional(&mut public, &mut data).await {
-                        Ok((up, down)) => debug!("{peer}: fechou ({up}B ↑, {down}B ↓)"),
+                        Ok((up, down)) => {
+                            state.metrics.bytes(Kind::Tcp, up, down);
+                            debug!("{peer}: fechou ({up}B ↑, {down}B ↓)")
+                        }
                         Err(e) => debug!("{peer}: {e}"),
                     }
                 }
                 _ => {
+                    state.metrics.conn_error(ConnError::DataTimeout);
                     state.forget(id);
                     debug!("{peer}: cliente não devolveu a conexão a tempo");
                 }
@@ -627,15 +662,20 @@ async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, tx: mpsc::Sender<Serve
     // Dois sentidos concorrentes no mesmo task: o primeiro que terminar
     // (erro/fechamento) encerra o outro, porque o `select!` descarta o perdedor.
     tokio::select! {
-        r = udp_to_stream(socket.clone(), wr) => debug!("udp->stream: {r:?}"),
-        r = stream_to_udp(socket, BufReader::new(rd)) => debug!("stream->udp: {r:?}"),
+        r = udp_to_stream(socket.clone(), wr, &state.metrics) => debug!("udp->stream: {r:?}"),
+        r = stream_to_udp(socket, BufReader::new(rd), &state.metrics) => debug!("stream->udp: {r:?}"),
     }
 }
 
-async fn udp_to_stream(socket: Arc<UdpSocket>, mut wr: tokio::net::tcp::OwnedWriteHalf) -> io::Result<()> {
+async fn udp_to_stream(
+    socket: Arc<UdpSocket>,
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    metrics: &Metrics,
+) -> io::Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (n, peer) = socket.recv_from(&mut buf).await?;
+        metrics.udp_in(n);
         write_msg(
             &mut wr,
             &UdpFrame {
@@ -650,10 +690,12 @@ async fn udp_to_stream(socket: Arc<UdpSocket>, mut wr: tokio::net::tcp::OwnedWri
 async fn stream_to_udp(
     socket: Arc<UdpSocket>,
     mut rd: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    metrics: &Metrics,
 ) -> io::Result<()> {
     loop {
         let f: UdpFrame = read_msg(&mut rd).await?;
         socket.send_to(&f.data, f.peer).await?;
+        metrics.udp_out(f.data.len());
     }
 }
 
@@ -692,9 +734,11 @@ async fn http_edge(listener: TcpListener, state: Arc<State>) {
 async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
     // Sem isso, Nagle + delayed ACK seguram respostas pequenas em keep-alive (~40ms).
     let _ = public.set_nodelay(true);
+    let _conn = state.metrics.conn(Kind::Http);
     let (head, host) = match timeout(Duration::from_secs(10), read_http_head(&mut public)).await {
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
+            state.metrics.conn_error(ConnError::BadRequest);
             respond(&mut public, "400 Bad Request", "requisição HTTP inválida").await;
             return Err(e);
         }
@@ -703,6 +747,7 @@ async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
 
     let route = subdomain_of(&state, &host).and_then(|sub| state.routes.lock().unwrap().get(&sub).cloned());
     let Some(route) = route else {
+        state.metrics.conn_error(ConnError::NoRoute);
         respond(
             &mut public,
             "404 Not Found",
@@ -713,17 +758,22 @@ async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
     };
 
     let (id, rx) = state.expect_conn();
+    let asked = Instant::now();
     if route.send(ServerMsg::NewConn(id)).await.is_err() {
         state.forget(id);
+        state.metrics.conn_error(ConnError::TunnelOffline);
         respond(&mut public, "502 Bad Gateway", "túnel offline").await;
         return Ok(());
     }
     match timeout(Duration::from_secs(10), rx).await {
         Ok(Ok(mut data)) => {
+            state.metrics.data_wait(asked.elapsed());
             data.write_all(&head).await?; // replay do que já consumimos
-            copy_bidirectional(&mut public, &mut data).await?;
+            let (up, down) = copy_bidirectional(&mut public, &mut data).await?;
+            state.metrics.bytes(Kind::Http, head.len() as u64 + up, down);
         }
         _ => {
+            state.metrics.conn_error(ConnError::DataTimeout);
             state.forget(id);
             respond(
                 &mut public,

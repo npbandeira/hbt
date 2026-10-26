@@ -9,6 +9,7 @@
 #   --http-bind A       onde escutar HTTP        (padrão 0.0.0.0:80)
 #   --control-bind A    porta de controle         (padrão 0.0.0.0:7000)
 #   --port-range A-B    portas públicas tcp/udp   (padrão 20000-30000)
+#   --metrics-bind A    métricas Prometheus       (padrão 127.0.0.1:9477; "" desliga)
 #
 # Idempotente: rodar de novo atualiza o binário e reinicia, mantendo os tokens.
 # Os tokens dos clientes ficam em /var/lib/hbt/tokens.json e são gerenciados com
@@ -16,7 +17,7 @@
 # Variável DESTDIR (como em pacotes) instala numa árvore de teste sem tocar no sistema.
 set -euo pipefail
 
-BIN="" DOMAIN="" HTTP_BIND="0.0.0.0:80" CONTROL_BIND="0.0.0.0:7000" RANGE="20000-30000"
+BIN="" DOMAIN="" HTTP_BIND="0.0.0.0:80" CONTROL_BIND="0.0.0.0:7000" RANGE="20000-30000" METRICS_BIND="127.0.0.1:9477"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bin) BIN="$2"; shift 2 ;;
@@ -24,7 +25,8 @@ while [[ $# -gt 0 ]]; do
     --http-bind) HTTP_BIND="$2"; shift 2 ;;
     --control-bind) CONTROL_BIND="$2"; shift 2 ;;
     --port-range) RANGE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    --metrics-bind) METRICS_BIND="$2"; shift 2 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "opção desconhecida: $1 (veja --help)" >&2; exit 2 ;;
   esac
 done
@@ -76,6 +78,7 @@ install -d -m 0755 "$ENV_DIR"
   [[ -n "$DOMAIN" ]] && echo "HBT_DOMAIN=$DOMAIN"
   echo "HBT_HTTP_BIND=$HTTP_BIND"
   echo "HBT_DATA_DIR=/var/lib/hbt"
+  if [[ -n "$METRICS_BIND" ]]; then echo "HBT_METRICS_BIND=$METRICS_BIND"; fi
 } > "$ENV_FILE"
 
 echo "==> serviço systemd"
@@ -131,6 +134,7 @@ if [[ -n "$DOMAIN" ]]; then
 else
   echo "  HTTP : desabilitado (reinstale com --domain para habilitar 'hbt http')"
 fi
+[[ -n "$METRICS_BIND" ]] && echo "  Métricas: http://$METRICS_BIND/metrics  (na sua máquina: ./scripts/observability.sh up <host-ssh>)"
 echo
 echo "Crie um token para cada cliente (mostrado uma única vez):"
 echo "  sudo -u hbt hbt-server token create meu-notebook"

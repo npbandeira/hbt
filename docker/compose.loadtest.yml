@@ -9,6 +9,7 @@ services:
     image: hbt:local
     command: >
       hbt-server serve --control-bind 0.0.0.0:7000 --port-range 20000-20010
+      --metrics-bind 0.0.0.0:9477
     environment:
       HBT_DOMAIN: localhost
       RUST_LOG: ${RUST_LOG:-warn}
@@ -17,8 +18,11 @@ services:
     memswap_limit: 2g # sem swap: estourar 2 GB = OOM, como no VPS
     ulimits:
       nofile: 65536
-    # Sem portas publicadas: o gerador de carga roda na mesma rede docker
-    # (evita o docker-proxy no caminho e conflito com portas do host).
+    # Só as métricas são publicadas (para ./scripts/observability.sh up). O
+    # gerador de carga roda na mesma rede docker: evita o docker-proxy no
+    # caminho do tráfego e conflito com portas do host.
+    ports:
+      - "127.0.0.1:19477:9477"
 
   backend:
     image: nginx:1.27-alpine

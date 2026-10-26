@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: hbt
+    static_configs:
+      # VPS: hbt-server escuta em 127.0.0.1:9477 lá; o túnel SSH traz para cá.
+      - targets: ["127.0.0.1:9477"]
+        labels: { instance: vps }
+      # Servidor do teste de carga (docker/compose.loadtest.yml), quando estiver no ar.
+      - targets: ["127.0.0.1:19477"]
+        labels: { instance: loadtest }

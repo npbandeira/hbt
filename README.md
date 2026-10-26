@@ -18,6 +18,7 @@ de um servidor na nuvem. Quem inicia todas as conexões é o **cliente**.
 |---|---|---|
 | `scripts/demo-local.sh` | sua máquina | **demonstração completa local**: servidor + site + túneis HTTP/TCP + limites + revogação, tudo em diretório temporário (`--keep` deixa no ar) |
 | `scripts/loadtest.sh` | sua máquina (Docker) | **teste de carga**: servidor em container com 1 CPU e 2 GB; mede túneis HTTP, TCP (oha) e UDP (`hbt-udpbench`). `MODES=udp` roda só um tipo |
+| `scripts/observability.sh` | sua máquina (Docker) | **observabilidade**: Prometheus + Grafana locais com dashboard pronto; `up vps` abre um túnel SSH até as métricas do servidor (`127.0.0.1:9477` no VPS) |
 | `scripts/build.sh` | sua máquina | roda os testes e gera `dist/` (nativo + estático musl) |
 | `scripts/install-server.sh` | **no VPS** | instala o serviço systemd `hbt-server` e mostra as portas a liberar. Idempotente: atualiza mantendo os tokens |
 | `scripts/install-client.sh` | sua máquina | copia `hbt` para `~/.local/bin` e (com `--server/--token`) já configura |
