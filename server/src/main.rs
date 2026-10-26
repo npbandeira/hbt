@@ -4,15 +4,15 @@
 //! Três tipos de túnel: TCP e UDP (porta pública dedicada) e HTTP (uma porta
 //! de entrada compartilhada; o `Host` da requisição escolhe o túnel).
 //!
-//! Fluxo TCP (resumo; detalhes em docs/GUIDE.md):
+//! Fluxo (resumo; detalhes em docs/GUIDE.md):
+//!
+//!   cliente conecta na porta de controle, autentica e registra o túnel;
+//!   a partir daí essa MESMA conexão vira uma sessão multiplexada (yamux).
 //!
 //!   usuário --> [porta pública no servidor]
-//!                   |  (1) servidor manda NewConn(id) pelo canal de controle
+//!                   |  servidor abre um stream novo na sessão (sem handshake)
 //!                   v
-//!               cliente abre NOVA conexão ao servidor: Hello::Accept(id)   (2)
-//!                   |  (3) servidor cola (copy) usuário <-> essa conexão
-//!                   v
-//!               cliente conecta no serviço local e cola as duas pontas
+//!               cliente recebe o stream, conecta no serviço local e cola as pontas
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -28,13 +28,13 @@ mod tokens;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use hbt_proto::mux::{self, Mode, MuxStream, Opener, StreamKind};
 use hbt_proto::*;
 use metrics::{ConnError, Kind, Metrics};
 use rand::Rng;
 use tokens::{TokenRecord, TokenStore};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, timeout};
 use tracing::{debug, info, warn};
 
@@ -164,18 +164,16 @@ struct State {
     port_range: RangeInclusive<u16>,
     /// Configuração do edge HTTP (None = desabilitado).
     http: Option<HttpCfg>,
-    /// subdomínio -> canal de controle do cliente dono dele. O edge HTTP usa
-    /// isto para pedir "abra uma conexão de dados" ao cliente certo.
-    routes: Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>,
-    /// Conexões públicas esperando o cliente "devolver" o lado de dados.
+    /// subdomínio -> sessão do cliente dono dele. O edge HTTP usa isto para
+    /// abrir um stream até o cliente certo.
     ///
     /// `std::sync::Mutex` e não `tokio::sync::Mutex`: a seção crítica é só
-    /// um insert/remove num HashMap (nanossegundos, sem `.await` dentro).
+    /// um get/insert num HashMap (nanossegundos, sem `.await` dentro).
     /// O mutex do Tokio é mais caro e só compensa quando você precisa
     /// segurar o lock ATRAVÉS de um `.await`. O compilador te protege: um
     /// guard de std Mutex não é `Send`, então segurá-lo num await dentro de
     /// um `spawn` dá erro de compilação.
-    pending: Mutex<HashMap<ConnId, oneshot::Sender<TcpStream>>>,
+    routes: Mutex<HashMap<String, Opener>>,
     metrics: Arc<Metrics>,
 }
 
@@ -194,21 +192,6 @@ struct RouteGuard {
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         self.state.routes.lock().unwrap().remove(&self.subdomain);
-    }
-}
-
-impl State {
-    /// Cria um id novo + um "canal de uma entrega" (`oneshot`) por onde a
-    /// conexão de dados será entregue a quem está esperando.
-    fn expect_conn(&self) -> (ConnId, oneshot::Receiver<TcpStream>) {
-        let id: ConnId = rand::random();
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        (id, rx)
-    }
-
-    fn forget(&self, id: ConnId) {
-        self.pending.lock().unwrap().remove(&id);
     }
 }
 
@@ -251,7 +234,6 @@ async fn serve(args: ServeArgs, tokens: TokenStore) -> Result<()> {
         port_range: args.port_range,
         http,
         routes: Mutex::new(HashMap::new()),
-        pending: Mutex::new(HashMap::new()),
         metrics: Arc::default(),
     });
 
@@ -306,34 +288,35 @@ async fn serve(args: ServeArgs, tokens: TokenStore) -> Result<()> {
     }
 }
 
-/// Decide, pela primeira mensagem, se é um cliente novo ou uma conexão de dados.
+const OLD_CLIENT: &str = "este cliente hbt é antigo (uma conexão por usuário); \
+     atualize o hbt para a versão com multiplexação";
+
+/// Uma conexão na porta de controle: handshake e, se der certo, o túnel.
 async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
     let hello: Hello = timeout(Duration::from_secs(5), read_msg(&mut stream))
         .await
         .context("timeout esperando Hello")??;
     match hello {
-        Hello::Accept(id) => {
-            let waiter = state.pending.lock().unwrap().remove(&id);
-            match waiter {
-                // `send` devolve a stream se ninguém mais espera (timeout); ignoramos.
-                Some(tx) => {
-                    let _ = stream.set_nodelay(true);
-                    let _ = tx.send(stream);
-                }
-                None => bail!("Accept com id desconhecido"),
-            }
-            Ok(())
+        // O cliente antigo só mostra (e desiste com) um `Error` recebido
+        // DEPOIS do desafio; antes disso ele só tentaria de novo para sempre.
+        Hello::V1Control { .. } => {
+            state.metrics.handshake_failed();
+            write_msg(&mut stream, &ServerMsg::Challenge(rand::random())).await?;
+            let _ = timeout(Duration::from_secs(5), read_msg::<_, ClientMsg>(&mut stream)).await;
+            let _ = write_msg(&mut stream, &ServerMsg::Error(OLD_CLIENT.into())).await;
+            bail!("cliente com protocolo antigo recusado")
         }
+        Hello::V1Accept(_) => bail!("conexão de dados do protocolo antigo"),
         Hello::Control { token_id } => {
             // Qualquer erro antes de "Registered" é reportado ao cliente.
-            let (tx, rx) = mpsc::channel::<ServerMsg>(64);
+            let (opener, requests) = mux::opener();
             match timeout(
                 Duration::from_secs(5),
-                negotiate(&mut stream, &state, &tx, &token_id),
+                negotiate(&mut stream, &state, &opener, &token_id),
             )
             .await
             {
-                Ok(Ok((bound, rec))) => run_tunnel(stream, state, bound, rec, tx, rx).await,
+                Ok(Ok((bound, rec))) => run_tunnel(stream, state, bound, rec, opener, requests).await,
                 Ok(Err(e)) => {
                     state.metrics.handshake_failed();
                     let _ = write_msg(&mut stream, &ServerMsg::Error(e.to_string())).await;
@@ -360,7 +343,7 @@ enum Bound {
 async fn negotiate(
     stream: &mut TcpStream,
     state: &Arc<State>,
-    tx: &mpsc::Sender<ServerMsg>,
+    opener: &Opener,
     token_id: &str,
 ) -> Result<(Bound, TokenRecord)> {
     // Id desconhecido recebe o desafio igual a um id válido e falha só depois
@@ -401,7 +384,7 @@ async fn negotiate(
             let (s, port) = bind_port(state.tunnel_ip, &range, remote_port, UdpSocket::bind).await?;
             (Bound::Udp(s), Public::Port(port))
         }
-        TunnelSpec::Http { subdomain } => register_http(state, tx, subdomain, &record)?,
+        TunnelSpec::Http { subdomain } => register_http(state, opener, subdomain, &record)?,
     };
     write_msg(stream, &ServerMsg::Registered { public }).await?;
     Ok((bound, record))
@@ -469,7 +452,7 @@ fn validate_subdomain(s: &str) -> Result<()> {
 
 fn register_http(
     state: &Arc<State>,
-    tx: &mpsc::Sender<ServerMsg>,
+    opener: &Opener,
     requested: Option<String>,
     record: &TokenRecord,
 ) -> Result<(Bound, Public)> {
@@ -504,7 +487,7 @@ fn register_http(
     if routes.contains_key(&sub) {
         bail!("subdomínio '{sub}' já está em uso");
     }
-    routes.insert(sub.clone(), tx.clone());
+    routes.insert(sub.clone(), opener.clone());
     drop(routes);
 
     let port = if cfg.port == 80 {
@@ -526,18 +509,22 @@ async fn run_tunnel(
     state: Arc<State>,
     bound: Bound,
     record: TokenRecord,
-    tx: mpsc::Sender<ServerMsg>,
-    mut rx: mpsc::Receiver<ServerMsg>,
+    opener: Opener,
+    requests: mux::Requests,
 ) -> Result<()> {
-    let (rd, mut wr) = stream.into_split();
+    // Daqui em diante a conexão é uma sessão multiplexada: um task a "gira"
+    // (proto/src/mux.rs) e todos os outros só abrem streams nela.
+    let mut session = AbortOnDrop(tokio::spawn(async move {
+        if let Err(e) = mux::run(stream, Mode::Server, requests, None).await {
+            debug!("sessão: {e}");
+        }
+    }));
+    // O primeiro stream é o de controle: heartbeats nos dois sentidos.
+    let ctl = opener.open(StreamKind::Control).await?;
+    let (rd, mut wr) = tokio::io::split(ctl);
     let mut rd = BufReader::new(rd);
 
-    // `rx` é o único consumidor (este loop, dono da escrita no socket de
-    // controle); produtores: listener TCP, pump UDP ou o edge HTTP (via
-    // `routes`). `mpsc` = multi producer, single consumer: evita dois tasks
-    // escrevendo ao mesmo tempo no mesmo socket.
-
-    // Leitura do canal de controle vive em task próprio porque `read_msg`
+    // Leitura do stream de controle vive em task próprio porque `read_msg`
     // não é cancel-safe (veja proto/src/lib.rs): não pode concorrer num
     // `select!`. Esperar um JoinHandle, por outro lado, é seguro.
     let mut reader = AbortOnDrop(tokio::spawn(async move {
@@ -560,15 +547,20 @@ async fn run_tunnel(
     let mut tunnel = None;
     let mut _route = None; // com nome: o guard só cai quando a função termina
     match bound {
-        Bound::Tcp(l) => tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(l, state.clone(), tx)))),
-        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state.clone(), tx)))),
+        Bound::Tcp(l) => {
+            tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(
+                l,
+                state.clone(),
+                opener,
+            ))))
+        }
+        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state.clone(), opener)))),
         Bound::Http(guard) => _route = Some(guard),
     }
 
     let mut beat = interval(HEARTBEAT_EVERY);
     loop {
         tokio::select! {
-            Some(msg) = rx.recv() => write_msg(&mut wr, &msg).await?,
             _ = beat.tick() => {
                 // Revogação: se o token sumiu do arquivo, derruba a sessão.
                 // Erro de leitura NÃO derruba (melhor manter túneis de pé
@@ -581,11 +573,13 @@ async fn run_tunnel(
             }
             _ = &mut reader.0 => break,
             _ = tunnel_done(&mut tunnel) => break,
+            _ = &mut session.0 => break,
         }
     }
     info!("túnel de '{}' encerrado", record.name);
-    // Ao sair, `reader` e `tunnel` sofrem Drop => tasks abortados => o
-    // listener é fechado e a porta pública liberada. Isso é RAII.
+    // Ao sair, `reader`, `tunnel` e `session` sofrem Drop => tasks abortados
+    // => o listener é fechado, a porta pública liberada e a conexão com o
+    // cliente cai (derrubando todos os streams). Isso é RAII.
     Ok(())
 }
 
@@ -599,7 +593,23 @@ async fn tunnel_done(tunnel: &mut Option<AbortOnDrop>) {
     }
 }
 
-async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, tx: mpsc::Sender<ServerMsg>) {
+/// Abre um stream até o cliente para um usuário público. Dá 10s: com o túnel
+/// no limite de conexões simultâneas, a abertura espera vaga.
+async fn open_conn(opener: &Opener, metrics: &Metrics) -> Result<MuxStream, ConnError> {
+    let asked = Instant::now();
+    let err = match timeout(Duration::from_secs(10), opener.open(StreamKind::Conn)).await {
+        Ok(Ok(s)) => {
+            metrics.data_wait(asked.elapsed());
+            return Ok(s);
+        }
+        Ok(Err(_)) => ConnError::TunnelOffline,
+        Err(_) => ConnError::DataTimeout,
+    };
+    metrics.conn_error(err);
+    Err(err)
+}
+
+async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, opener: Opener) {
     loop {
         let (mut public, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -610,18 +620,11 @@ async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, tx: mpsc::Sen
             }
         };
         let _ = public.set_nodelay(true);
-        let (id, rx) = state.expect_conn();
-        if tx.send(ServerMsg::NewConn(id)).await.is_err() {
-            return; // canal de controle morreu
-        }
-        let state = state.clone();
-        let asked = Instant::now();
+        let (state, opener) = (state.clone(), opener.clone());
         tokio::spawn(async move {
             let _conn = state.metrics.conn(Kind::Tcp);
-            // Dá 10s para o cliente abrir a conexão de dados.
-            match timeout(Duration::from_secs(10), rx).await {
-                Ok(Ok(mut data)) => {
-                    state.metrics.data_wait(asked.elapsed());
+            match open_conn(&opener, &state.metrics).await {
+                Ok(mut data) => {
                     // Copia nos dois sentidos até um lado fechar.
                     match copy_bidirectional(&mut public, &mut data).await {
                         Ok((up, down)) => {
@@ -631,32 +634,22 @@ async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, tx: mpsc::Sen
                         Err(e) => debug!("{peer}: {e}"),
                     }
                 }
-                _ => {
-                    state.metrics.conn_error(ConnError::DataTimeout);
-                    state.forget(id);
-                    debug!("{peer}: cliente não devolveu a conexão a tempo");
-                }
+                Err(e) => debug!("{peer}: sem stream até o cliente ({e:?})"),
             }
         });
     }
 }
 
-/// UDP: um único stream TCP de dados carrega TODOS os datagramas do túnel.
-async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, tx: mpsc::Sender<ServerMsg>) {
-    let (id, rx) = state.expect_conn();
-    if tx.send(ServerMsg::NewUdpStream(id)).await.is_err() {
-        return;
-    }
-    let data = match timeout(Duration::from_secs(10), rx).await {
+/// UDP: um único stream da sessão carrega TODOS os datagramas do túnel.
+async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, opener: Opener) {
+    let data = match timeout(Duration::from_secs(10), opener.open(StreamKind::Udp)).await {
         Ok(Ok(s)) => s,
         _ => {
-            state.forget(id);
-            warn!("cliente não abriu o stream UDP");
+            warn!("não consegui abrir o stream UDP até o cliente");
             return;
         }
     };
-    let _ = data.set_nodelay(true);
-    let (rd, wr) = data.into_split();
+    let (rd, wr) = tokio::io::split(data);
     let socket = Arc::new(socket);
 
     // Dois sentidos concorrentes no mesmo task: o primeiro que terminar
@@ -669,7 +662,7 @@ async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, tx: mpsc::Sender<Serve
 
 async fn udp_to_stream(
     socket: Arc<UdpSocket>,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    mut wr: tokio::io::WriteHalf<MuxStream>,
     metrics: &Metrics,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; 65535];
@@ -689,7 +682,7 @@ async fn udp_to_stream(
 
 async fn stream_to_udp(
     socket: Arc<UdpSocket>,
-    mut rd: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut rd: BufReader<tokio::io::ReadHalf<MuxStream>>,
     metrics: &Metrics,
 ) -> io::Result<()> {
     loop {
@@ -757,30 +750,20 @@ async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
         return Ok(());
     };
 
-    let (id, rx) = state.expect_conn();
-    let asked = Instant::now();
-    if route.send(ServerMsg::NewConn(id)).await.is_err() {
-        state.forget(id);
-        state.metrics.conn_error(ConnError::TunnelOffline);
-        respond(&mut public, "502 Bad Gateway", "túnel offline").await;
-        return Ok(());
-    }
-    match timeout(Duration::from_secs(10), rx).await {
-        Ok(Ok(mut data)) => {
-            state.metrics.data_wait(asked.elapsed());
+    match open_conn(&route, &state.metrics).await {
+        Ok(mut data) => {
             data.write_all(&head).await?; // replay do que já consumimos
             let (up, down) = copy_bidirectional(&mut public, &mut data).await?;
             state.metrics.bytes(Kind::Http, head.len() as u64 + up, down);
         }
-        _ => {
-            state.metrics.conn_error(ConnError::DataTimeout);
-            state.forget(id);
+        Err(ConnError::TunnelOffline) => respond(&mut public, "502 Bad Gateway", "túnel offline").await,
+        Err(_) => {
             respond(
                 &mut public,
                 "504 Gateway Timeout",
-                "o cliente do túnel não respondeu",
+                "o túnel está no limite de conexões simultâneas",
             )
-            .await;
+            .await
         }
     }
     Ok(())

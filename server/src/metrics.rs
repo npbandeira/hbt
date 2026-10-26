@@ -28,13 +28,14 @@ pub enum Kind {
 
 const KINDS: [&str; 3] = ["tcp", "udp", "http"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ConnError {
-    /// O cliente não abriu a conexão de dados em 10s.
+    /// Não houve vaga para abrir o stream até o cliente em 10s (túnel no
+    /// limite de conexões simultâneas).
     DataTimeout = 0,
     /// HTTP para um subdomínio sem túnel (404).
     NoRoute = 1,
-    /// O túnel existia mas o canal de controle já tinha caído (502).
+    /// O túnel existia mas a sessão com o cliente já tinha caído (502).
     TunnelOffline = 2,
     /// Requisição HTTP inválida ou sem Host (400).
     BadRequest = 3,
@@ -42,11 +43,14 @@ pub enum ConnError {
 
 const CONN_ERRORS: [&str; 4] = ["data_timeout", "no_route", "tunnel_offline", "bad_request"];
 
-/// Limites (em segundos) do histograma de espera pela conexão de dados: o
-/// tempo entre pedir `NewConn` ao cliente e ele conectar de volta. É ~1 RTT
-/// servidor<->cliente; é o custo que multiplexar conexões eliminaria.
-const WAIT_BUCKETS: [f64; 13] = [
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+/// Limites (em segundos) do histograma de espera para abrir o caminho até o
+/// cliente para um usuário público. No protocolo antigo era ~2 RTT (o cliente
+/// abria uma conexão TCP nova); com a sessão multiplexada é só abrir um stream
+/// (microssegundos), a menos que o túnel esteja no limite de conexões e a
+/// abertura espere vaga. Os baldes cobrem os dois casos.
+const WAIT_BUCKETS: [f64; 19] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.5, 1.0,
+    2.5, 5.0, 10.0,
 ];
 
 #[derive(Default)]
@@ -247,7 +251,7 @@ impl Metrics {
             &mut o,
             "hbt_data_conn_wait_seconds",
             "histogram",
-            "Espera entre pedir a conexão de dados ao cliente e ela chegar (~1 RTT).",
+            "Espera para abrir o caminho até o cliente para um usuário público (stream novo na sessão).",
         );
         let mut acc = 0;
         for (i, b) in WAIT_BUCKETS.iter().enumerate() {

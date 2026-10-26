@@ -2,37 +2,49 @@
 
 ## 1. Arquitetura
 
-Workspace Cargo com 4 crates:
+Workspace Cargo com 5 crates:
 
 | crate | tipo | papel |
 |---|---|---|
-| `proto` | lib | mensagens, framing, autenticação (compartilhado) |
+| `proto` | lib | mensagens, framing, autenticação, multiplexação (compartilhado) |
 | `server` | bin `hbt-server` | roda na nuvem |
 | `client` | bin `hbt` | CLI |
 | `e2e` | testes | sobe os binários reais e passa tráfego |
+| `bench` | bin `hbt-udpbench` | gerador de carga UDP do teste de carga |
 
 **Workspace**: vários crates num repositório compartilhando `Cargo.lock` e
 `target/`. Evita compilar dependências duas vezes e permite que cliente e
 servidor usem o *mesmo* crate de protocolo.
 
-### Três tipos de conexão TCP, todas iniciadas pelo cliente
+### Uma conexão TCP por túnel, iniciada pelo cliente
 
-1. **Controle** (longa duração): autentica, registra a porta, recebe avisos.
-2. **Dados TCP** (uma por usuário público): servidor avisa `NewConn(id)`,
-   cliente abre uma conexão nova com `Accept(id)`, servidor cola usuário↔dados.
-3. **Dados UDP** (uma por túnel): carrega todos os datagramas em frames.
+1. **Handshake**: o cliente conecta na porta de controle, manda `Hello`,
+   responde ao desafio HMAC e registra o túnel (`Register` → `Registered`).
+2. **Sessão multiplexada**: a partir daí a MESMA conexão vira uma sessão
+   [yamux](https://github.com/hashicorp/yamux/blob/master/spec.md)
+   (`proto/src/mux.rs`). O servidor abre *streams* lógicos dentro dela; cada
+   stream começa com um byte de tipo:
+   - **controle** (um por sessão): heartbeats nos dois sentidos;
+   - **conexão** (um por usuário público, TCP ou HTTP): bytes crus;
+   - **UDP** (um por túnel): todos os datagramas em `UdpFrame`s.
+
+```
+usuário ──► [porta pública] ──► servidor abre stream nº N ══ sessão (1 conexão TCP) ══► cliente ──► serviço local
+```
+
+Abrir um stream não tem handshake: o servidor já manda os dados junto com o
+cabeçalho do stream. Por isso uma conexão pública nova custa 1 RTT até o
+cliente (a requisição em si), e não ~3 RTT como no protocolo antigo, em que o
+cliente abria uma conexão TCP nova até o servidor para cada usuário.
 
 ### Túneis HTTP (`hbt http 3000`)
 
 Em vez de uma porta pública por túnel, o servidor tem UMA porta de entrada
 HTTP. Para cada conexão ele lê os cabeçalhos, extrai `Host: abc.dominio.com`,
-procura `abc` na tabela de rotas (`subdomínio -> canal do cliente`) e a partir
-daí reaproveita exatamente o mecanismo TCP (`NewConn` + conexão de dados),
-só reenviando antes os bytes já lidos. Se não houver rota: 404; cliente
-offline: 502; cliente não respondeu a tempo: 504.
-
-Por que uma conexão nova por usuário em vez de multiplexar tudo numa só?
-Veja trade-offs abaixo.
+procura `abc` na tabela de rotas (`subdomínio -> sessão do cliente`) e a partir
+daí reaproveita exatamente o mecanismo TCP (um stream novo na sessão), só
+reenviando antes os bytes já lidos. Se não houver rota: 404; sessão caída:
+502; túnel no limite de conexões simultâneas por 10s: 504.
 
 ## 2. Glossário
 
@@ -64,8 +76,11 @@ Veja trade-offs abaixo.
 - **Heartbeat**: mensagem periódica para detectar par morto (cabo puxado, NAT
   que esqueceu a conexão), pois nesses casos o TCP não avisa por minutos.
 - **Exponential backoff**: reconexão com espera crescente (1s, 2s, 4s… 30s).
-- **Capability**: o `ConnId` aleatório de 128 bits prova que quem o apresenta
-  recebeu o id pelo canal autenticado; não precisa reautenticar.
+- **Multiplexação / stream**: várias conversas independentes dentro de uma
+  conexão. Cada pedaço de dado leva o número do stream a que pertence; o outro
+  lado separa por esse número. Cada stream tem controle de fluxo próprio
+  (janela), então um usuário lento não enche a memória nem trava os outros
+  por falta de espaço.
 - **Cancel safety**: um future descartado no meio (ex.: perder um `select!`)
   pode ter consumido bytes. `read_exact` não é cancel safe; `mpsc::recv` e
   esperar `JoinHandle` são.
@@ -85,21 +100,43 @@ Veja trade-offs abaixo.
 | `let ... else` | `negotiate` | Desestrutura ou sai: `let ClientMsg::Auth(m) = x else { bail!() }`. |
 | Genéricos + traits | `read_msg<R: AsyncRead + Unpin, T>` | Mesma função para TcpStream, buffers em memória (testes)... resolvido na compilação. |
 | `Arc<T>` | `State`, sockets UDP | Dono compartilhado com contagem atômica. `Rc` seria a versão single-thread (não é `Send`). |
-| `Mutex` | `pending`, `sessions` | `std::sync::Mutex` para seções curtas sem `.await`; `tokio::sync::Mutex` só se precisar segurar o lock através de um await. |
+| `Mutex` | `routes`, `sessions` | `std::sync::Mutex` para seções curtas sem `.await`; `tokio::sync::Mutex` só se precisar segurar o lock através de um await. |
 | RAII / `Drop` | `AbortOnDrop` | Limpeza automática ao sair de escopo, em qualquer caminho, inclusive erro. |
-| `mpsc`, `oneshot` | servidor | Passar mensagens entre tasks em vez de compartilhar memória. `oneshot` = entrega única (aqui: entregar a conexão de dados a quem espera). |
+| `mpsc`, `oneshot` | `proto/src/mux.rs` | Passar mensagens entre tasks em vez de compartilhar memória. Quem quer um stream manda um `oneshot` ao task que gira a sessão e espera a resposta por ele (entrega única). |
+| `poll_fn` / `Poll` | `mux::run` | Um future escrito à mão: a cada "poll" atendemos pedidos de stream e fazemos a sessão andar; `Poll::Pending` devolve a vez ao runtime, que nos acorda quando houver I/O. |
 | `select!` | `run_tunnel`, `main` | Espera vários futures; o primeiro que completar vence e os outros são descartados. |
 | Lifetimes | quase invisíveis aqui | Evitamos ao clonar/`Arc` antes de `spawn`; o compilador infere o resto. |
 | `#[cfg(test)]` | `proto` | Código de teste só compilado em `cargo test`. |
 
 ## 4. Trade-offs das decisões
 
-**Conexão de dados por usuário vs. multiplexação (yamux/QUIC)**
-Nossa escolha: uma conexão TCP nova por usuário. Simples, sem HOL blocking
-entre usuários, backpressure natural do TCP. Custo: um round-trip extra (e
-handshake TCP) por conexão e mais sockets abertos. Multiplexar tudo numa
-conexão (como frp/rathole com yamux) economiza handshakes, mas um pacote
-perdido atrasa todos os usuários e a implementação é bem mais complexa.
+**Multiplexação (yamux) vs. uma conexão por usuário**
+A primeira versão abria uma conexão TCP nova do cliente até o servidor para
+cada usuário público. Medido com ping de 63 ms até o VPS: uma requisição com
+conexão nova levava ~200 ms (~3 RTT); com keep-alive, ~70 ms. Sob ~60
+conexões novas por segundo, a rede do cliente (NAT/roteador) passou a perder
+pacotes e apareceram 504s. Com muitas conexões curtas, o cliente também
+esgotava as portas efêmeras (TIME_WAIT). Hoje tudo passa por uma conexão só,
+como frp/rathole: nada disso existe. Custo: um pacote perdido nessa conexão
+atrasa todos os usuários do túnel até a retransmissão (HOL blocking), e todo o
+tráfego passa por um task só por sessão. Num servidor com 1 CPU isso não
+reduziu a vazão de forma relevante depois de bufferizar o socket (o yamux
+escreve cabeçalho e corpo de cada frame em chamadas separadas).
+Alternativa sem HOL blocking: QUIC (`quinn`), que multiplexa sobre UDP.
+
+**Limite de streams por sessão**
+O yamux derruba a sessão INTEIRA se o número de streams passar do limite
+configurado, e só "esquece" um stream fechado um pouco depois. Por isso o
+limite dele é 2048 e o nosso, controlado por um semáforo, é 1024 conexões
+simultâneas por túnel: acima disso, conexões novas esperam vaga (até 10s,
+depois 504) em vez de derrubar o túnel.
+
+**Compatibilidade entre versões**
+O bincode identifica variantes de enum pela posição, então as mensagens do
+protocolo antigo continuam declaradas (`V1Control`, `V1NewConn`...) só para
+não deslocar as outras. Um cliente antigo recebe "atualize o hbt" e para,
+em vez de tentar reconectar para sempre; um cliente novo num servidor antigo
+avisa que o servidor parece antigo.
 
 **UDP dentro de TCP**
 Nossa escolha: datagramas viajam num stream TCP com framing. Simples e
@@ -165,9 +202,9 @@ Com token compartilhado, qualquer cliente pode pegar qualquer subdomínio livre
 evitar condição de corrida.
 
 **Um túnel por processo `hbt`**
-Simples e isolado (uma falha não derruba as outras). Custo: uma conexão de
-controle por túnel. Evolução: arquivo de config com vários túneis, multiplexados
-na mesma conexão de controle.
+Simples e isolado (uma falha não derruba as outras). Custo: uma conexão por
+túnel. Evolução: arquivo de config com vários túneis na mesma sessão (o
+protocolo de streams já comporta isso).
 
 **Faixa de portas + token único**
 Todos os clientes compartilham o mesmo token e podem pedir qualquer porta da
@@ -177,9 +214,9 @@ servidor enviar UDP para destinos arbitrários (abuso de reflexão); aceitável
 com clientes confiáveis.
 
 **Limites ainda ausentes (por escolha)**
-Sem limite de conexões simultâneas por túnel, sem rate limit de tentativas de
-autenticação, sem métricas. Em produção adicione-os (semáforo do Tokio,
-`tower`, Prometheus).
+Sem rate limit de tentativas de autenticação. Em produção adicione-o (`tower`,
+fail2ban lendo o log). Conexões simultâneas por túnel são limitadas (1024) e
+há métricas Prometheus (`--metrics-bind`).
 
 ## 5. Boas práticas aplicadas
 
@@ -195,9 +232,10 @@ autenticação, sem métricas. Em produção adicione-os (semáforo do Tokio,
 ## 6. Para estudar na ordem
 
 1. `proto/src/lib.rs` (tipos, genéricos, framing)
-2. `client/src/main.rs` (clap, async, retry)
-3. `server/src/main.rs` (estado compartilhado, canais, select)
-4. `e2e/tests/tunnel.rs` (como testar sistemas de rede)
+2. `proto/src/mux.rs` (multiplexação, um future escrito à mão com `poll_fn`)
+3. `client/src/main.rs` (clap, async, retry)
+4. `server/src/main.rs` (estado compartilhado, canais, select)
+5. `e2e/tests/tunnel.rs` (como testar sistemas de rede)
 
 Recursos: *The Rust Book* (doc.rust-lang.org/book), *Tokio tutorial*
 (tokio.rs/tokio/tutorial), *Rust by Example*.

@@ -38,6 +38,22 @@
       }
     ]
   },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "name": "Annotations & Alerts",
+        "type": "dashboard",
+        "enable": true,
+        "hide": true,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "iconColor": "#c3c2b7"
+      }
+    ]
+  },
   "panels": [
     {
       "id": 1,
@@ -224,7 +240,7 @@
       "id": 4,
       "type": "stat",
       "title": "Espera p99",
-      "description": "Tempo até o cliente abrir a conexão de dados (~1 RTT servidor↔cliente), últimos 5 min.",
+      "description": "Tempo para abrir um stream até o cliente, últimos 5 min. Com a sessão multiplexada é ~0; sobe se o túnel estiver no limite de 1024 conexões.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -511,7 +527,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "Conexões novas por segundo",
-      "description": "Cada conexão pública abre uma conexão de dados nova até o cliente.",
+      "description": "Cada conexão pública vira um stream novo na sessão multiplexada com o cliente.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -787,7 +803,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Espera pela conexão de dados",
-      "description": "Latência extra que cada conexão nova paga (~1 RTT até o cliente). É o que multiplexar eliminaria.",
+      "description": "Tempo para abrir o stream até o cliente. No protocolo antigo (conexão TCP nova por usuário) era ~2 RTT; multiplexado, ~0.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -884,7 +900,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Conexões que falharam, por motivo",
-      "description": "data_timeout: cliente não abriu a conexão de dados em 10s (504). no_route: subdomínio sem túnel (404). tunnel_offline: túnel caiu (502). bad_request: HTTP inválido (400).",
+      "description": "data_timeout: túnel no limite de conexões simultâneas por 10s (504). no_route: subdomínio sem túnel (404). tunnel_offline: sessão com o cliente caiu (502). bad_request: HTTP inválido (400).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

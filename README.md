@@ -90,7 +90,12 @@ python3 -m http.server 3000 &
 hbt http 3000 --subdomain demo          # abra http://demo.localhost:8080
 ```
 
-Um processo `hbt` = um túnel; rode vários para expor várias portas.
+Um processo `hbt` = um túnel; rode vários para expor várias portas. Cada túnel
+usa **uma única conexão TCP** até o servidor: todos os usuários públicos passam
+multiplexados dentro dela (yamux), sem handshake extra por conexão.
+
+Cliente e servidor precisam falar a mesma versão do protocolo: ao atualizar o
+`hbt-server`, atualize também os clientes (`hbt` antigo recebe "atualize o hbt").
 
 ## Desenvolvimento
 

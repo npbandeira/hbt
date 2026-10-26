@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
+pub mod mux;
+
 /// Tamanho máximo de um frame. Sem esse limite, um atacante poderia mandar
 /// "tamanho = 4 GB" e nos fazer alocar essa memória antes de qualquer
 /// validação. 128 KiB cobre um datagrama UDP (máx. ~64 KiB) com folga.
@@ -22,11 +24,6 @@ pub const MAX_FRAME: usize = 128 * 1024;
 /// Intervalo entre heartbeats e tempo sem ouvir nada até declarar o par morto.
 pub const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Identificador de uma conexão pendente. 128 bits aleatórios: impossível de
-/// adivinhar, então saber o id funciona como uma "capability" (prova de que
-/// você recebeu o id pelo canal de controle já autenticado).
-pub type ConnId = u128;
 
 /// O que o cliente quer expor. Cada variante carrega só os campos que fazem
 /// sentido para ela: o tipo torna impossível, por exemplo, pedir um
@@ -50,14 +47,23 @@ pub enum TunnelSpec {
 /// Primeira mensagem de TODA conexão que chega na porta de controle.
 /// Um `enum` em Rust é uma "union tagged": o valor é exatamente UMA variante,
 /// e o `match` obriga a tratar todas.
+///
+/// O bincode identifica a variante pela POSIÇÃO. Por isso as variantes do
+/// protocolo antigo continuam aqui, no mesmo lugar: um cliente antigo ainda
+/// é entendido o suficiente para receber "atualize o hbt" em vez de lixo.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Hello {
+    /// Protocolo 1 (uma conexão TCP nova por usuário). Só é recusado.
+    V1Control { token_id: String },
+    /// Protocolo 1: conexão de dados. Só é recusado.
+    V1Accept(u128),
     /// "Sou o cliente cujo token tem este id; abrindo um túnel": segue o
     /// desafio HMAC. O id NÃO é secreto (é só o "nome de usuário"); serve
     /// para o servidor achar qual chave usar na verificação.
+    ///
+    /// Depois de `Registered`, a conexão vira uma sessão multiplexada
+    /// (veja [`mux`]).
     Control { token_id: String },
-    /// "Sou uma conexão de dados que o servidor pediu via `NewConn`/`NewUdpStream`".
-    Accept(ConnId),
 }
 
 /// Endereço público do túnel. O servidor não sabe com que nome o mundo o
@@ -69,7 +75,7 @@ pub enum Public {
     Port(u16),
 }
 
-/// Mensagens do servidor -> cliente no canal de controle.
+/// Mensagens do servidor -> cliente: no handshake e, depois, no stream de controle.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Challenge([u8; 32]),
@@ -78,15 +84,16 @@ pub enum ServerMsg {
     Registered {
         public: Public,
     },
-    /// Chegou um usuário público (TCP): abra uma conexão de dados com este id.
-    NewConn(ConnId),
-    /// Túnel UDP: abra a conexão de dados que carregará os datagramas.
-    NewUdpStream(ConnId),
+    /// Protocolo 1; não é mais enviado. Fica para não mudar a posição das
+    /// variantes seguintes (o cliente antigo precisa decodificar `Error`).
+    V1NewConn(u128),
+    /// Protocolo 1; idem.
+    V1NewUdpStream(u128),
     Heartbeat,
     Error(String),
 }
 
-/// Mensagens do cliente -> servidor no canal de controle.
+/// Mensagens do cliente -> servidor: no handshake e, depois, no stream de controle.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     Auth(Vec<u8>),
@@ -94,7 +101,7 @@ pub enum ClientMsg {
     Heartbeat,
 }
 
-/// Um datagrama UDP viajando dentro do stream TCP de dados.
+/// Um datagrama UDP viajando dentro do stream UDP do túnel.
 /// `peer` = quem mandou (lado público); precisamos dele para responder à
 /// pessoa certa, já que UDP não tem "conexão".
 #[derive(Debug, Serialize, Deserialize)]

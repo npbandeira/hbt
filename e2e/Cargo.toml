@@ -5,4 +5,5 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
+hbt-proto = { path = "../proto" }
 tokio.workspace = true

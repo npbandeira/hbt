@@ -6,8 +6,10 @@
 //!   hbt tcp 22             # porta pública (sorteada) para o ssh local
 //!   hbt udp 51820          # idem para UDP
 //!
-//! "Reverse" tunnel: quem inicia TODAS as conexões é o cliente (saída), então
-//! funciona atrás de NAT/firewall sem abrir nenhuma porta de entrada.
+//! "Reverse" tunnel: quem inicia a conexão é o cliente (saída), então funciona
+//! atrás de NAT/firewall sem abrir nenhuma porta de entrada. É UMA conexão só:
+//! depois do handshake ela vira uma sessão multiplexada e cada usuário público
+//! chega como um stream dentro dela (veja proto/src/mux.rs).
 
 mod config;
 
@@ -19,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use hbt_proto::mux::{self, Mode, MuxStream, StreamKind};
 use hbt_proto::*;
 use tokio::io::{copy_bidirectional, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
@@ -267,7 +270,9 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
 
     let msg: ServerMsg = timeout(Duration::from_secs(5), read_msg(&mut ctl))
         .await
-        .context("timeout")??;
+        .context("timeout")?
+        // Um hbt-server antigo não entende o Hello novo e só fecha a conexão.
+        .context("o servidor fechou a conexão no handshake (hbt-server antigo, sem multiplexação?)")?;
     let ServerMsg::Challenge(nonce) = msg else {
         bail!("esperava Challenge")
     };
@@ -297,7 +302,33 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
         _ => bail!("resposta inesperada ao registro"),
     }
 
-    let (rd, mut wr) = ctl.into_split();
+    // Daqui em diante a conexão é uma sessão multiplexada: o servidor abre
+    // os streams e nós só os recebemos (o `Opener` daqui nunca é usado).
+    let (in_tx, mut in_rx) = mpsc::channel::<mux::Stream>(mux::MAX_STREAMS);
+    let (_opener, requests) = mux::opener();
+    let mut session = AbortOnDrop(tokio::spawn(async move {
+        if let Err(e) = mux::run(ctl, Mode::Client, requests, Some(in_tx)).await {
+            debug!("sessão: {e}");
+        }
+    }));
+
+    // Cada stream recebido ganha um task; o de controle volta para cá.
+    let (ctl_tx, mut ctl_rx) = mpsc::channel::<MuxStream>(1);
+    let local = plan.local.clone();
+    let _dispatcher = AbortOnDrop(tokio::spawn(async move {
+        while let Some(raw) = in_rx.recv().await {
+            tokio::spawn(dispatch(raw, local.clone(), ctl_tx.clone()));
+        }
+    }));
+
+    // O servidor abre o stream de controle logo depois de `Registered`.
+    let ctl = tokio::select! {
+        c = timeout(Duration::from_secs(5), ctl_rx.recv()) => c
+            .context("timeout esperando o stream de controle")?
+            .context("sessão encerrada")?,
+        _ = &mut session.0 => bail!("conexão com o servidor caiu"),
+    };
+    let (rd, mut wr) = tokio::io::split(ctl);
     let mut rd = BufReader::new(rd);
 
     // Heartbeat do cliente => o servidor detecta quando morremos sem FIN
@@ -314,6 +345,8 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
         }
     }));
 
+    // Se a sessão cair, a leitura do stream de controle falha e saímos daqui;
+    // ao sair, os guards derrubam a sessão e todos os streams junto.
     loop {
         // Se o timeout estourar, `?` sai da função: a sessão é descartada
         // inteira, então perder bytes de uma leitura cancelada não importa.
@@ -321,22 +354,6 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
             .await
             .context("servidor sem heartbeat")??;
         match msg {
-            ServerMsg::NewConn(id) => {
-                let (server, local) = (conn.server.clone(), plan.local.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = tcp_data(server, id, local).await {
-                        warn!("conexão TCP: {e:#}");
-                    }
-                });
-            }
-            ServerMsg::NewUdpStream(id) => {
-                let (server, local) = (conn.server.clone(), plan.local.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = udp_data(server, id, local).await {
-                        debug!("stream UDP: {e:#}");
-                    }
-                });
-            }
             ServerMsg::Heartbeat => {}
             ServerMsg::Error(e) => bail!("erro do servidor: {e}"),
             _ => bail!("mensagem inesperada"),
@@ -344,24 +361,40 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
     }
 }
 
-/// Uma conexão de usuário: abre o lado de dados e cola no serviço local.
-/// Erros ao montar a conexão sobem (viram `warn`); erros da cópia depois disso
+/// Um stream aberto pelo servidor: o primeiro byte diz o que ele carrega.
+async fn dispatch(raw: mux::Stream, local: String, ctl: mpsc::Sender<MuxStream>) {
+    let (kind, stream) = match MuxStream::accept(raw).await {
+        Ok(x) => x,
+        Err(e) => return debug!("stream inválido: {e}"),
+    };
+    match kind {
+        StreamKind::Control => {
+            let _ = ctl.send(stream).await;
+        }
+        StreamKind::Conn => {
+            if let Err(e) = tcp_conn(stream, &local).await {
+                warn!("conexão TCP: {e:#}");
+            }
+        }
+        StreamKind::Udp => {
+            if let Err(e) = udp_data(stream, &local).await {
+                debug!("stream UDP: {e:#}");
+            }
+        }
+    }
+}
+
+/// Uma conexão de usuário: cola o stream no serviço local.
+/// Erro ao conectar no serviço sobe (vira `warn`); erros da cópia depois disso
 /// são o usuário/serviço fechando e ficam em `debug`.
-async fn tcp_data(server: String, id: ConnId, local: String) -> Result<()> {
-    // Cada conexão pública abre uma conexão de dados nova: sob muitas conexões
-    // curtas, as portas efêmeras desta máquina podem acabar (TIME_WAIT).
-    let mut data = TcpStream::connect(&server)
-        .await
-        .with_context(|| format!("abrindo conexão de dados com {server}"))?;
-    write_msg(&mut data, &Hello::Accept(id)).await?;
-    // Conectamos no serviço local DEPOIS de aceitar no servidor: se o serviço
-    // local estiver fora, o erro fecha `data` na hora e o usuário público é
-    // desconectado rápido, em vez de ficar pendurado até o timeout.
-    let mut svc = TcpStream::connect(&local)
+async fn tcp_conn(mut stream: MuxStream, local: &str) -> Result<()> {
+    // Se o serviço local estiver fora, o `?` descarta o stream: o servidor
+    // recebe um reset e o usuário público é desconectado na hora.
+    let mut svc = TcpStream::connect(local)
         .await
         .with_context(|| format!("serviço local {local} indisponível"))?;
-    let _ = (data.set_nodelay(true), svc.set_nodelay(true));
-    if let Err(e) = copy_bidirectional(&mut data, &mut svc).await {
+    let _ = svc.set_nodelay(true);
+    if let Err(e) = copy_bidirectional(&mut stream, &mut svc).await {
         debug!("conexão TCP: {e}");
     }
     Ok(())
@@ -371,16 +404,13 @@ type Sessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>;
 
 /// Túnel UDP. Cada "peer" público ganha um socket UDP local próprio, para o
 /// serviço local enxergar origens distintas e as respostas voltarem ao peer certo.
-async fn udp_data(server: String, id: ConnId, local: String) -> Result<()> {
-    let local_addr = tokio::net::lookup_host(&local)
+async fn udp_data(stream: MuxStream, local: &str) -> Result<()> {
+    let local_addr = tokio::net::lookup_host(local)
         .await?
         .next()
         .with_context(|| format!("não resolvi {local}"))?;
 
-    let mut data = TcpStream::connect(&server).await?;
-    write_msg(&mut data, &Hello::Accept(id)).await?;
-    let _ = data.set_nodelay(true);
-    let (rd, mut wr) = data.into_split();
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
 
     // Respostas do serviço local -> canal -> UM task escritor no stream.
