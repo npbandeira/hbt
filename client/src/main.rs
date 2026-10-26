@@ -325,7 +325,7 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
                 let (server, local) = (conn.server.clone(), plan.local.clone());
                 tokio::spawn(async move {
                     if let Err(e) = tcp_data(server, id, local).await {
-                        debug!("conexão TCP: {e:#}");
+                        warn!("conexão TCP: {e:#}");
                     }
                 });
             }
@@ -345,8 +345,14 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
 }
 
 /// Uma conexão de usuário: abre o lado de dados e cola no serviço local.
+/// Erros ao montar a conexão sobem (viram `warn`); erros da cópia depois disso
+/// são o usuário/serviço fechando e ficam em `debug`.
 async fn tcp_data(server: String, id: ConnId, local: String) -> Result<()> {
-    let mut data = TcpStream::connect(&server).await?;
+    // Cada conexão pública abre uma conexão de dados nova: sob muitas conexões
+    // curtas, as portas efêmeras desta máquina podem acabar (TIME_WAIT).
+    let mut data = TcpStream::connect(&server)
+        .await
+        .with_context(|| format!("abrindo conexão de dados com {server}"))?;
     write_msg(&mut data, &Hello::Accept(id)).await?;
     // Conectamos no serviço local DEPOIS de aceitar no servidor: se o serviço
     // local estiver fora, o erro fecha `data` na hora e o usuário público é
@@ -355,7 +361,9 @@ async fn tcp_data(server: String, id: ConnId, local: String) -> Result<()> {
         .await
         .with_context(|| format!("serviço local {local} indisponível"))?;
     let _ = (data.set_nodelay(true), svc.set_nodelay(true));
-    copy_bidirectional(&mut data, &mut svc).await?;
+    if let Err(e) = copy_bidirectional(&mut data, &mut svc).await {
+        debug!("conexão TCP: {e}");
+    }
     Ok(())
 }
 

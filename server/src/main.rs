@@ -300,6 +300,7 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
             match waiter {
                 // `send` devolve a stream se ninguém mais espera (timeout); ignoramos.
                 Some(tx) => {
+                    let _ = stream.set_nodelay(true);
                     let _ = tx.send(stream);
                 }
                 None => bail!("Accept com id desconhecido"),
@@ -689,6 +690,8 @@ async fn http_edge(listener: TcpListener, state: Arc<State>) {
 /// hosts numa conexão só seria roteado pelo primeiro. Em troca, WebSocket,
 /// streaming e uploads grandes funcionam sem esforço (não parseamos corpos).
 async fn handle_http(mut public: TcpStream, state: Arc<State>) -> Result<()> {
+    // Sem isso, Nagle + delayed ACK seguram respostas pequenas em keep-alive (~40ms).
+    let _ = public.set_nodelay(true);
     let (head, host) = match timeout(Duration::from_secs(10), read_http_head(&mut public)).await {
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {

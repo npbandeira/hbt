@@ -17,6 +17,7 @@ de um servidor na nuvem. Quem inicia todas as conexões é o **cliente**.
 | Script | Onde roda | O que faz |
 |---|---|---|
 | `scripts/demo-local.sh` | sua máquina | **demonstração completa local**: servidor + site + túneis HTTP/TCP + limites + revogação, tudo em diretório temporário (`--keep` deixa no ar) |
+| `scripts/loadtest.sh` | sua máquina (Docker) | **teste de carga**: servidor em container com 1 CPU e 2 GB; mede túneis HTTP, TCP (oha) e UDP (`hbt-udpbench`). `MODES=udp` roda só um tipo |
 | `scripts/build.sh` | sua máquina | roda os testes e gera `dist/` (nativo + estático musl) |
 | `scripts/install-server.sh` | **no VPS** | instala o serviço systemd `hbt-server` e mostra as portas a liberar. Idempotente: atualiza mantendo os tokens |
 | `scripts/install-client.sh` | sua máquina | copia `hbt` para `~/.local/bin` e (com `--server/--token`) já configura |

@@ -1,0 +1,59 @@
+# Teste de carga: só o servidor é limitado (1 CPU, 2 GB), como um VPS pequeno.
+# Backend, clientes e gerador de carga ficam sem limite para não virarem o gargalo.
+# Use via ./scripts/loadtest.sh.
+name: hbt-loadtest
+
+services:
+  server:
+    build: ..
+    image: hbt:local
+    command: >
+      hbt-server serve --control-bind 0.0.0.0:7000 --port-range 20000-20010
+    environment:
+      HBT_DOMAIN: localhost
+      RUST_LOG: ${RUST_LOG:-warn}
+    cpus: 1
+    mem_limit: 2g
+    memswap_limit: 2g # sem swap: estourar 2 GB = OOM, como no VPS
+    ulimits:
+      nofile: 65536
+    # Sem portas publicadas: o gerador de carga roda na mesma rede docker
+    # (evita o docker-proxy no caminho e conflito com portas do host).
+
+  backend:
+    image: nginx:1.27-alpine
+
+  udp-echo:
+    build: { context: .., target: bench }
+    image: hbt:bench
+    command: hbt-udpbench echo --bind 0.0.0.0:9000
+
+  # Cada conexão pública = 1 conexão de dados nova do cliente até o servidor.
+  # Com os padrões do Linux, ~28k conexões curtas por minuto esgotam as portas
+  # efêmeras do cliente (TIME_WAIT) e os túneis param. No teste ampliamos isso
+  # para medir o servidor; numa máquina real que receba muitas conexões curtas,
+  # aplique os mesmos sysctls no host do cliente.
+  client-http:
+    image: hbt:local
+    command: hbt http backend:80 --subdomain load
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    depends_on: [server, backend]
+    profiles: [clients]
+    sysctls: &client-sysctls
+      net.ipv4.tcp_tw_reuse: 1
+      net.ipv4.ip_local_port_range: "1024 65535"
+
+  client-tcp:
+    image: hbt:local
+    command: hbt tcp backend:80 --remote-port 20000
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    depends_on: [server, backend]
+    profiles: [clients]
+    sysctls: *client-sysctls
+
+  client-udp:
+    image: hbt:local
+    command: hbt udp udp-echo:9000 --remote-port 20001
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    depends_on: [server, udp-echo]
+    profiles: [clients]

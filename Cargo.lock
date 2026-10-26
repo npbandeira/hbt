@@ -259,6 +259,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hbt-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "hbt-e2e"
 version = "0.1.0"
 dependencies = [
