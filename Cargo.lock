@@ -339,7 +339,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hbt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hbt-proto",
  "tokio",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "futures",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
