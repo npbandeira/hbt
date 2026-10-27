@@ -121,3 +121,22 @@ pub fn token_admin(store: &TokenStore, cmd: TokenCmd) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_accepts_valid_ranges() {
+        assert_eq!(parse_range("20000-30000").unwrap(), 20000..=30000);
+        assert_eq!(parse_range("80-80").unwrap(), 80..=80);
+    }
+
+    #[test]
+    fn parse_range_rejects_bad_input() {
+        assert!(parse_range("20000").is_err());
+        assert!(parse_range("30000-20000").is_err());
+        assert!(parse_range("a-b").is_err());
+        assert!(parse_range("1-70000").is_err());
+    }
+}

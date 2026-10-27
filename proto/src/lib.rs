@@ -5,8 +5,10 @@
 //! que cliente e servidor nunca discordem sobre o formato das mensagens —
 //! o compilador checa os dois lados contra os mesmos tipos.
 
-use std::io;
+#![warn(missing_docs)]
+
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -14,7 +16,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
+pub mod error;
 pub mod mux;
+
+pub use error::ProtoError;
 
 /// Tamanho máximo de um frame. Sem esse limite, um atacante poderia mandar
 /// "tamanho = 4 GB" e nos fazer alocar essa memória antes de qualquer
@@ -22,8 +27,10 @@ pub mod mux;
 pub const MAX_FRAME: usize = 128 * 1024;
 
 /// Intervalo entre heartbeats e tempo sem ouvir nada até declarar o par morto.
-pub const HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Intervalo entre heartbeats.
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
+/// Tempo sem ouvir nada do par até declará-lo morto.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// O que o cliente quer expor. Cada variante carrega só os campos que fazem
 /// sentido para ela: o tipo torna impossível, por exemplo, pedir um
@@ -31,15 +38,20 @@ pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TunnelSpec {
     /// `None` = o servidor sorteia uma porta livre da faixa permitida.
+    /// Túnel TCP numa porta pública dedicada.
     Tcp {
+        /// Porta pública pedida.
         remote_port: Option<u16>,
     },
+    /// Túnel UDP numa porta pública dedicada.
     Udp {
+        /// Porta pública pedida.
         remote_port: Option<u16>,
     },
     /// Túnel HTTP: o servidor roteia por `Host: <subdomínio>.<domínio>`.
     /// `None` = servidor sorteia um subdomínio.
     Http {
+        /// Subdomínio pedido.
         subdomain: Option<String>,
     },
 }
@@ -54,7 +66,10 @@ pub enum TunnelSpec {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Hello {
     /// Protocolo 1 (uma conexão TCP nova por usuário). Só é recusado.
-    V1Control { token_id: String },
+    V1Control {
+        /// Id do token.
+        token_id: String,
+    },
     /// Protocolo 1: conexão de dados. Só é recusado.
     V1Accept(u128),
     /// "Sou o cliente cujo token tem este id; abrindo um túnel": segue o
@@ -63,7 +78,10 @@ pub enum Hello {
     ///
     /// Depois de `Registered`, a conexão vira uma sessão multiplexada
     /// (veja [`mux`]).
-    Control { token_id: String },
+    Control {
+        /// Id do token (não secreto).
+        token_id: String,
+    },
 }
 
 /// Endereço público do túnel. O servidor não sabe com que nome o mundo o
@@ -71,17 +89,22 @@ pub enum Hello {
 /// devolve só a porta; em HTTP devolve a URL completa (ele conhece o domínio).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Public {
+    /// URL completa (túneis HTTP).
     Url(String),
+    /// Porta pública (túneis TCP/UDP).
     Port(u16),
 }
 
 /// Mensagens do servidor -> cliente: no handshake e, depois, no stream de controle.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
+    /// Desafio de autenticação: nonce de uso único.
     Challenge([u8; 32]),
+    /// Autenticação aceita.
     AuthOk,
     /// `public` diz como o túnel ficou acessível.
     Registered {
+        /// Endereço público atribuído ao túnel.
         public: Public,
     },
     /// Protocolo 1; não é mais enviado. Fica para não mudar a posição das
@@ -89,15 +112,20 @@ pub enum ServerMsg {
     V1NewConn(u128),
     /// Protocolo 1; idem.
     V1NewUdpStream(u128),
+    /// Sinal de vida periódico.
     Heartbeat,
+    /// Erro fatal reportado ao cliente, em texto legível.
     Error(String),
 }
 
 /// Mensagens do cliente -> servidor: no handshake e, depois, no stream de controle.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
+    /// Resposta ao desafio: HMAC do nonce.
     Auth(Vec<u8>),
+    /// Pedido de registro do túnel.
     Register(TunnelSpec),
+    /// Sinal de vida periódico.
     Heartbeat,
 }
 
@@ -106,7 +134,9 @@ pub enum ClientMsg {
 /// pessoa certa, já que UDP não tem "conexão".
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UdpFrame {
+    /// Endereço do par público que enviou (e que receberá a resposta).
     pub peer: SocketAddr,
+    /// Conteúdo do datagrama.
     pub data: Vec<u8>,
 }
 
@@ -122,14 +152,17 @@ pub struct UdpFrame {
 /// metade de um stream, um buffer em memória nos testes...). O compilador
 /// gera uma versão da função para cada tipo usado (monomorphization):
 /// zero custo em runtime, ao custo de binário um pouco maior.
-pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> io::Result<()>
+pub async fn write_msg<W, T>(w: &mut W, msg: &T) -> Result<(), ProtoError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = bincode::serialize(msg).map_err(io::Error::other)?;
+    let body = bincode::serialize(msg).map_err(ProtoError::Encode)?;
     if body.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+        return Err(ProtoError::FrameTooLarge {
+            len: body.len(),
+            max: MAX_FRAME,
+        });
     }
     // Um único buffer => um único write_all => menos syscalls e sem risco de
     // outro task intercalar bytes entre o tamanho e o corpo.
@@ -137,7 +170,8 @@ where
     buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
     buf.extend_from_slice(&body);
     w.write_all(&buf).await?;
-    w.flush().await
+    w.flush().await?;
+    Ok(())
 }
 
 /// Lê um frame escrito por `write_msg`.
@@ -147,7 +181,7 @@ where
 /// descartado no meio da leitura e bytes já consumidos se perdem,
 /// corrompendo o stream. Aqui só a chamamos em loops dedicados ou com
 /// `timeout` seguido de abandono da conexão.
-pub async fn read_msg<R, T>(r: &mut R) -> io::Result<T>
+pub async fn read_msg<R, T>(r: &mut R) -> Result<T, ProtoError>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
@@ -156,11 +190,11 @@ where
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(ProtoError::FrameTooLarge { len, max: MAX_FRAME });
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    bincode::deserialize(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    bincode::deserialize(&body).map_err(ProtoError::Decode)
 }
 
 // ------------------------------------------------------------------- auth
@@ -190,10 +224,12 @@ pub fn derive_key(secret: &str) -> [u8; 32] {
     Sha256::digest(format!("hbt-token-v1:{secret}")).into()
 }
 
+/// Codifica bytes em hexadecimal minúsculo.
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Decodifica hexadecimal; `None` se o tamanho for ímpar ou houver caractere inválido.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
@@ -244,6 +280,8 @@ impl Drop for AbortOnDrop {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
 
     #[tokio::test]
@@ -264,7 +302,8 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         a.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         let err = read_msg::<_, ServerMsg>(&mut b).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, ProtoError::FrameTooLarge { .. }));
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

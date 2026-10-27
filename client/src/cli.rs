@@ -147,3 +147,20 @@ pub fn resolve(cli: &Cli) -> Result<Conn> {
         key: derive_key(secret),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_port_means_localhost() {
+        assert_eq!(local_addr("3000"), "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn explicit_targets_are_kept() {
+        assert_eq!(local_addr("192.168.0.10:8080"), "192.168.0.10:8080");
+        assert_eq!(local_addr("meu-host:22"), "meu-host:22");
+        assert_eq!(local_addr(""), "");
+    }
+}

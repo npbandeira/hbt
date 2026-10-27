@@ -233,3 +233,52 @@ fn register_http(
     };
     Ok((Bound::Http(guard), Public::Url(url)))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    #[test]
+    fn subdomain_validation() {
+        for ok in ["a", "app", "ana-dev", "a1b2c3d4", &"a".repeat(63)] {
+            assert!(validate_subdomain(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-a", "a-", "A", "a.b", "a_b", "ç", &"a".repeat(64)] {
+            assert!(validate_subdomain(bad).is_err(), "{bad}");
+        }
+    }
+
+    const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[tokio::test]
+    async fn bind_port_rejects_port_outside_range() {
+        let err = bind_port(LOCALHOST, &(20000..=20010), Some(80), TcpListener::bind)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("fora da faixa"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bind_port_picks_a_free_port_in_range() {
+        let range = 40000..=40100;
+        let (_listener, port) = bind_port(LOCALHOST, &range, None, TcpListener::bind)
+            .await
+            .unwrap();
+        assert!(range.contains(&port));
+    }
+
+    #[tokio::test]
+    async fn bind_port_reports_busy_port() {
+        let (_held, port) = bind_port(LOCALHOST, &(41000..=41100), None, TcpListener::bind)
+            .await
+            .unwrap();
+        let err = bind_port(LOCALHOST, &(41000..=41100), Some(port), TcpListener::bind)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("indisponível"), "{err}");
+    }
+}

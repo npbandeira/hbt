@@ -140,3 +140,55 @@ async fn respond(s: &mut TcpStream, status: &str, body: &str) {
     );
     let _ = s.write_all(msg.as_bytes()).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::state::HttpCfg;
+    use crate::tokens::TokenStore;
+
+    fn state(domain: Option<&str>) -> State {
+        State {
+            tokens: TokenStore::new(std::env::temp_dir().as_path()),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port_range: 20000..=30000,
+            http: domain.map(|d| HttpCfg {
+                domain: d.to_owned(),
+                port: 80,
+            }),
+            routes: Mutex::new(HashMap::new()),
+            metrics: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn extracts_single_level_subdomain() {
+        let st = state(Some("tunnel.exemplo.com"));
+        assert_eq!(
+            subdomain_of(&st, "app.tunnel.exemplo.com").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            subdomain_of(&st, "App.Tunnel.Exemplo.com:8080").as_deref(),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn rejects_hosts_outside_the_domain() {
+        let st = state(Some("tunnel.exemplo.com"));
+        assert_eq!(subdomain_of(&st, "tunnel.exemplo.com"), None);
+        assert_eq!(subdomain_of(&st, "a.b.tunnel.exemplo.com"), None);
+        assert_eq!(subdomain_of(&st, "app.outro.com"), None);
+        assert_eq!(subdomain_of(&st, "apptunnel.exemplo.com"), None);
+    }
+
+    #[test]
+    fn http_disabled_means_no_routing() {
+        assert_eq!(subdomain_of(&state(None), "app.tunnel.exemplo.com"), None);
+    }
+}

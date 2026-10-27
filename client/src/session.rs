@@ -1,6 +1,5 @@
 //! Sessão com o servidor: handshake, reconexão, heartbeat e despacho de streams.
 
-use std::fmt;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -16,14 +15,9 @@ use crate::cli::{Conn, Plan};
 use crate::forward::{tcp_conn, udp_data};
 
 /// Erro que não adianta tentar de novo (ex.: token errado).
-#[derive(Debug)]
-pub struct Fatal(String);
-impl fmt::Display for Fatal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-impl std::error::Error for Fatal {}
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Fatal(pub String);
 
 fn print_banner(conn: &Conn, plan: &Plan, public: &Public) {
     let url = match public {
