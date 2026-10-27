@@ -7,3 +7,6 @@ publish = false
 [dev-dependencies]
 hbt-proto = { path = "../proto" }
 tokio.workspace = true
+
+[lints]
+workspace = true

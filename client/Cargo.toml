@@ -13,3 +13,6 @@ anyhow.workspace = true
 dirs = "7.0.0"
 toml = "1.1.8"
 serde.workspace = true
+
+[lints]
+workspace = true

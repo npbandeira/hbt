@@ -233,9 +233,9 @@ há métricas Prometheus (`--metrics-bind`).
 
 1. `proto/src/lib.rs` (tipos, genéricos, framing)
 2. `proto/src/mux.rs` (multiplexação, um future escrito à mão com `poll_fn`)
-3. `client/src/main.rs` (clap, async, retry)
-4. `server/src/main.rs` (estado compartilhado, canais, select)
-5. `e2e/tests/tunnel.rs` (como testar sistemas de rede)
+3. `client/src/` (`cli.rs` clap → `session.rs` retry/heartbeat → `forward.rs` repasse TCP/UDP)
+4. `server/src/` (`state.rs` estado compartilhado → `control.rs` handshake → `tunnel.rs` select/RAII → `http_edge.rs`)
+5. `e2e/tests/` (`common/` fixtures; `tunnels.rs`, `http.rs`, `auth.rs`, `configure.rs`: como testar sistemas de rede)
 
 Recursos: *The Rust Book* (doc.rust-lang.org/book), *Tokio tutorial*
 (tokio.rs/tokio/tutorial), *Rust by Example*.

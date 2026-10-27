@@ -115,7 +115,23 @@ multiplexados dentro dela (yamux), sem handshake extra por conexão.
 Cliente e servidor precisam falar a mesma versão do protocolo: ao atualizar o
 `hbt-server`, atualize também os clientes (`hbt` antigo recebe "atualize o hbt").
 
+## Estrutura do repositório
+
+| Pasta | Conteúdo |
+|---|---|
+| `proto/` | protocolo (mensagens, framing) e multiplexação yamux, compartilhados |
+| `server/` | `hbt-server`: `cli.rs` (args/tokens), `serve.rs` (listeners), `control.rs` (handshake/registro), `tunnel.rs` (sessão, TCP/UDP), `http_edge.rs` (roteamento por Host), `state.rs`, `tokens.rs`, `metrics.rs` |
+| `client/` | `hbt`: `cli.rs` (args/credenciais), `session.rs` (conexão, reconexão, heartbeat), `forward.rs` (repasse TCP/UDP), `config.rs` |
+| `e2e/` | testes ponta a ponta com os binários reais, por área: `tunnels`, `http`, `auth`, `configure` (helpers em `tests/common/`) |
+| `bench/` | `hbt-udpbench`, usado pelo teste de carga |
+| `scripts/` | build, deploy, instalação, demo e teste de carga |
+| `docker/`, `observability/` | stack de teste de carga e Prometheus/Grafana |
+| `docs/` | guia de arquitetura e notas de release |
+
 ## Desenvolvimento
+
+Convenções: lints do workspace em `Cargo.toml` (`[workspace.lints]`), `unsafe`
+proibido, sem `unwrap()` em caminhos de rede (só em locks e testes).
 
 ```sh
 cargo fmt --all

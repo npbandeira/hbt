@@ -13,3 +13,6 @@ rand.workspace = true
 yamux = "0.14.1"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
+
+[lints]
+workspace = true

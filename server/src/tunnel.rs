@@ -1,0 +1,207 @@
+//! Vida de um túnel: heartbeat, revogação e repasse de TCP/UDP.
+
+use std::io;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use hbt_proto::mux::{self, Mode, MuxStream, Opener, StreamKind};
+use hbt_proto::*;
+use tokio::io::{copy_bidirectional, BufReader};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::time::{interval, timeout};
+use tracing::{debug, info, warn};
+
+use crate::control::Bound;
+use crate::metrics::{ConnError, Kind, Metrics};
+use crate::state::State;
+use crate::tokens::TokenRecord;
+
+/// Vive enquanto o cliente estiver conectado.
+pub async fn run_tunnel(
+    stream: TcpStream,
+    state: Arc<State>,
+    bound: Bound,
+    record: TokenRecord,
+    opener: Opener,
+    requests: mux::Requests,
+) -> Result<()> {
+    // Daqui em diante a conexão é uma sessão multiplexada: um task a "gira"
+    // (proto/src/mux.rs) e todos os outros só abrem streams nela.
+    let mut session = AbortOnDrop(tokio::spawn(async move {
+        if let Err(e) = mux::run(stream, Mode::Server, requests, None).await {
+            debug!("sessão: {e}");
+        }
+    }));
+    // O primeiro stream é o de controle: heartbeats nos dois sentidos.
+    let ctl = opener.open(StreamKind::Control).await?;
+    let (rd, mut wr) = tokio::io::split(ctl);
+    let mut rd = BufReader::new(rd);
+
+    // Leitura do stream de controle vive em task próprio porque `read_msg`
+    // não é cancel-safe (veja proto/src/lib.rs): não pode concorrer num
+    // `select!`. Esperar um JoinHandle, por outro lado, é seguro.
+    let mut reader = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            match timeout(HEARTBEAT_TIMEOUT, read_msg::<_, ClientMsg>(&mut rd)).await {
+                Ok(Ok(_heartbeat)) => {}
+                Ok(Err(e)) => return debug!("controle fechou: {e}"),
+                Err(_) => return debug!("cliente sem heartbeat; considerado morto"),
+            }
+        }
+    }));
+
+    let _session = state.metrics.session(match bound {
+        Bound::Tcp(_) => Kind::Tcp,
+        Bound::Udp(_) => Kind::Udp,
+        Bound::Http(_) => Kind::Http,
+    });
+
+    // Túneis TCP/UDP têm um task; HTTP só uma rota (guard) que vive até o fim.
+    let mut tunnel = None;
+    let mut _route = None; // com nome: o guard só cai quando a função termina
+    match bound {
+        Bound::Tcp(l) => {
+            tunnel = Some(AbortOnDrop(tokio::spawn(tcp_accept_loop(
+                l,
+                state.clone(),
+                opener,
+            ))))
+        }
+        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state.clone(), opener)))),
+        Bound::Http(guard) => _route = Some(guard),
+    }
+
+    let mut beat = interval(HEARTBEAT_EVERY);
+    loop {
+        tokio::select! {
+            _ = beat.tick() => {
+                // Revogação: se o token sumiu do arquivo, derruba a sessão.
+                // Erro de leitura NÃO derruba (melhor manter túneis de pé
+                // do que cortar todo mundo por um problema momentâneo).
+                if matches!(state.tokens.find(&record.id).await, Ok(None)) {
+                    warn!("token '{}' revogado: encerrando sessão", record.name);
+                    break;
+                }
+                write_msg(&mut wr, &ServerMsg::Heartbeat).await?
+            }
+            _ = &mut reader.0 => break,
+            _ = tunnel_done(&mut tunnel) => break,
+            _ = &mut session.0 => break,
+        }
+    }
+    info!("túnel de '{}' encerrado", record.name);
+    // Ao sair, `reader`, `tunnel` e `session` sofrem Drop => tasks abortados
+    // => o listener é fechado, a porta pública liberada e a conexão com o
+    // cliente cai (derrubando todos os streams). Isso é RAII.
+    Ok(())
+}
+
+/// Completa quando o task do túnel termina; para HTTP (sem task) nunca completa.
+async fn tunnel_done(tunnel: &mut Option<AbortOnDrop>) {
+    match tunnel {
+        Some(t) => {
+            let _ = (&mut t.0).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Abre um stream até o cliente para um usuário público. Dá 10s: com o túnel
+/// no limite de conexões simultâneas, a abertura espera vaga.
+pub async fn open_conn(opener: &Opener, metrics: &Metrics) -> Result<MuxStream, ConnError> {
+    let asked = Instant::now();
+    let err = match timeout(Duration::from_secs(10), opener.open(StreamKind::Conn)).await {
+        Ok(Ok(s)) => {
+            metrics.data_wait(asked.elapsed());
+            return Ok(s);
+        }
+        Ok(Err(_)) => ConnError::TunnelOffline,
+        Err(_) => ConnError::DataTimeout,
+    };
+    metrics.conn_error(err);
+    Err(err)
+}
+
+async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, opener: Opener) {
+    loop {
+        let (mut public, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("accept público falhou: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let _ = public.set_nodelay(true);
+        let (state, opener) = (state.clone(), opener.clone());
+        tokio::spawn(async move {
+            let _conn = state.metrics.conn(Kind::Tcp);
+            match open_conn(&opener, &state.metrics).await {
+                Ok(mut data) => {
+                    // Copia nos dois sentidos até um lado fechar.
+                    match copy_bidirectional(&mut public, &mut data).await {
+                        Ok((up, down)) => {
+                            state.metrics.bytes(Kind::Tcp, up, down);
+                            debug!("{peer}: fechou ({up}B ↑, {down}B ↓)")
+                        }
+                        Err(e) => debug!("{peer}: {e}"),
+                    }
+                }
+                Err(e) => debug!("{peer}: sem stream até o cliente ({e:?})"),
+            }
+        });
+    }
+}
+
+/// UDP: um único stream da sessão carrega TODOS os datagramas do túnel.
+async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, opener: Opener) {
+    let data = match timeout(Duration::from_secs(10), opener.open(StreamKind::Udp)).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            warn!("não consegui abrir o stream UDP até o cliente");
+            return;
+        }
+    };
+    let (rd, wr) = tokio::io::split(data);
+    let socket = Arc::new(socket);
+
+    // Dois sentidos concorrentes no mesmo task: o primeiro que terminar
+    // (erro/fechamento) encerra o outro, porque o `select!` descarta o perdedor.
+    tokio::select! {
+        r = udp_to_stream(socket.clone(), wr, &state.metrics) => debug!("udp->stream: {r:?}"),
+        r = stream_to_udp(socket, BufReader::new(rd), &state.metrics) => debug!("stream->udp: {r:?}"),
+    }
+}
+
+async fn udp_to_stream(
+    socket: Arc<UdpSocket>,
+    mut wr: tokio::io::WriteHalf<MuxStream>,
+    metrics: &Metrics,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, peer) = socket.recv_from(&mut buf).await?;
+        metrics.udp_in(n);
+        write_msg(
+            &mut wr,
+            &UdpFrame {
+                peer,
+                data: buf[..n].to_vec(),
+            },
+        )
+        .await?;
+    }
+}
+
+async fn stream_to_udp(
+    socket: Arc<UdpSocket>,
+    mut rd: BufReader<tokio::io::ReadHalf<MuxStream>>,
+    metrics: &Metrics,
+) -> io::Result<()> {
+    loop {
+        let f: UdpFrame = read_msg(&mut rd).await?;
+        socket.send_to(&f.data, f.peer).await?;
+        metrics.udp_out(f.data.len());
+    }
+}

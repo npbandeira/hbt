@@ -106,7 +106,7 @@ impl TokenStore {
         }
         if let Some(list) = &subdomains {
             for s in list {
-                crate::validate_subdomain(s)?;
+                crate::control::validate_subdomain(s)?;
             }
         }
         let mut records = self.load()?;
