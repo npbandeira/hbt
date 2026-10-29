@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-29
+
+Versão maior porque o transporte mudou e **servidor e clientes antigos não conversam com os novos**: atualize os dois lados juntos, libere `7000/udp` e configure o fingerprint em cada cliente (`hbt configure --fingerprint ...`; o servidor mostra com `hbt-server fingerprint`). Os tokens existentes continuam valendo.
+
 ### Adicionado
 
 - **Site no próprio `hbt-server`** (`--web-bind`, atrás de um proxy com HTTPS): landing page, cadastro e login com e-mail e senha e um painel onde cada pessoa cria os próprios tokens e copia o comando `hbt configure ...` pronto. O cliente `hbt` não muda: não há login no CLI, ele só guarda o token.
@@ -87,6 +91,7 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/npbandeira/hbt/compare/v0.1.1...v2.0.0
 [0.1.1]: https://github.com/npbandeira/hbt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/npbandeira/hbt/releases/tag/v0.1.0

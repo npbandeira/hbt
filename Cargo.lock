@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "hbt"
-version = "0.1.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-bench"
-version = "0.1.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-e2e"
-version = "0.1.1"
+version = "2.0.0"
 dependencies = [
  "hbt-proto",
  "tokio",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-proto"
-version = "0.1.1"
+version = "2.0.0"
 dependencies = [
  "bincode",
  "hmac",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "hbt-server"
-version = "0.1.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "argon2",
