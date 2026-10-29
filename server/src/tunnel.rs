@@ -47,6 +47,7 @@ pub async fn run_tunnel(
         }
     }));
 
+    let _online = state.mark_online(&record.id);
     let _session = state.metrics.session(match bound {
         Bound::Tcp(_) => Kind::Tcp,
         Bound::Udp(_) => Kind::Udp,
@@ -81,7 +82,7 @@ pub async fn run_tunnel(
                 // Revogação: se o token sumiu do arquivo, derruba a sessão.
                 // Erro de leitura NÃO derruba (melhor manter túneis de pé
                 // do que cortar todo mundo por um problema momentâneo).
-                if matches!(state.tokens.find(&record.id).await, Ok(None)) {
+                if matches!(state.store.find(&record.id).await, Ok(None)) {
                     warn!("token '{}' revogado: encerrando sessão", record.name);
                     break;
                 }

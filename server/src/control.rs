@@ -82,7 +82,7 @@ async fn negotiate(
     // Id desconhecido recebe o desafio igual a um id válido e falha só depois
     // da verificação, com a MESMA mensagem: assim não dá para descobrir quais
     // ids existem (user enumeration) olhando respostas ou tempo.
-    let record = state.tokens.find(token_id).await?;
+    let record = state.store.find(token_id).await?;
     let key = record
         .as_ref()
         .and_then(|r| hex_decode(&r.key))

@@ -128,8 +128,14 @@ async fn token_cli_create_list_revoke() {
     assert!(list.contains("notebook") && list.contains(id) && list.contains("20000-20010"));
     assert!(list.contains("ana,ana-dev"));
     assert!(!list.contains(secret), "list não pode mostrar o segredo");
-    let on_disk = std::fs::read_to_string(fx.dir.join("tokens.json")).unwrap();
-    assert!(!on_disk.contains(secret), "o segredo cru não pode estar no disco");
+    // Banco e WAL: o segredo cru não pode estar em nenhum dos dois.
+    for file in ["hbt.db", "hbt.db-wal"] {
+        let bytes = std::fs::read(fx.dir.join(file)).unwrap_or_default();
+        assert!(
+            !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "o segredo cru não pode estar em {file}"
+        );
+    }
 
     assert!(
         !fx.token_cmd(&["create", "notebook"]).status.success(),

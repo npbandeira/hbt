@@ -15,8 +15,10 @@
 //!                   v
 //!               cliente recebe o stream, conecta no serviço local e cola as pontas
 
+mod accounts;
 mod cli;
 mod control;
+mod db;
 mod http_edge;
 mod identity;
 mod metrics;
@@ -24,12 +26,13 @@ mod serve;
 mod state;
 mod tokens;
 mod tunnel;
+mod web;
 
 use anyhow::Result;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use tokens::TokenStore;
+use db::Store;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,13 +43,16 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let store = TokenStore::new(&cli.data_dir);
     match cli.cmd {
-        Command::Token { cmd } => cli::token_admin(&store, cmd, &cli.data_dir),
+        Command::Token { cmd } => cli::token_admin(&Store::open(&cli.data_dir)?, cmd, &cli.data_dir),
+        Command::User { cmd } => cli::user_admin(&Store::open(&cli.data_dir)?, cmd),
         Command::Fingerprint => {
             println!("{}", identity::load_or_create(&cli.data_dir)?.fingerprint());
             Ok(())
         }
-        Command::Serve(args) => serve::serve(args, store, identity::load_or_create(&cli.data_dir)?).await,
+        Command::Serve(args) => {
+            let store = Store::open(&cli.data_dir)?;
+            serve::serve(args, store, identity::load_or_create(&cli.data_dir)?).await
+        }
     }
 }

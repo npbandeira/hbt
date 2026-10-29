@@ -73,6 +73,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="docs/releases/$GITHUB_REF_NAME.md"
-          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          # Notas = seção da versão no CHANGELOG.md; sem ela, o GitHub gera.
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '/^## \[/ { on = index($0, "[" v "]") == 4; next } on' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then set -- --notes-file notes.md; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" dist/* --title "hbt $GITHUB_REF_NAME" "$@"

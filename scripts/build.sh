@@ -18,6 +18,16 @@ cargo build --release --quiet
 
 echo "==> build estático ($TARGET)"
 rustup target add "$TARGET" >/dev/null 2>&1 || true
+# O ring (QUIC) e o SQLite embutido compilam C, então o alvo musl precisa de um
+# compilador C para musl (no Debian/Ubuntu: sudo apt install musl-tools).
+if command -v musl-gcc >/dev/null; then
+  export CC_x86_64_unknown_linux_musl=musl-gcc
+else
+  echo "aviso: musl-gcc não encontrado (sudo apt install musl-tools). Usando o gcc do host com flags de contorno:" >&2
+  echo "       funciona (testado), mas compila o C contra os headers do glibc e não é o caminho suportado." >&2
+  export CC_x86_64_unknown_linux_musl=gcc
+  export CFLAGS_x86_64_unknown_linux_musl="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DSQLITE_DISABLE_LFS"
+fi
 cargo build --release --quiet --target "$TARGET"
 
 mkdir -p dist

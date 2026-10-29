@@ -1,0 +1,149 @@
+/* Fonte do CSS do site. O arquivo servido (app.css) é gerado por
+   ./scripts/build-css.sh a partir deste e das classes em server/src/web/. */
+@import "tailwindcss";
+@source "../src/web";
+
+@font-face {
+  font-family: "Literata";
+  src: url("/assets/literata.woff2") format("woff2");
+  font-weight: 200 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Martian Mono";
+  src: url("/assets/martian-mono.woff2") format("woff2");
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+/* Paleta do painel de rack. Cada papel tem um valor claro e um escuro; os
+   contrastes (texto >= 4.5:1, bordas de campo >= 3:1) foram conferidos nos dois. */
+:root {
+  --c-concrete: #d9dee5;
+  --c-panel: #eef0f3;
+  --c-ink: #19202b;
+  --c-muted: #4a5566;
+  --c-line: #b7bfcb;
+  --c-edge: #6b7686;
+  --c-cable: #1a52c2;
+  --c-oncable: #ffffff;
+  --c-led: #27b24a;
+  --c-brass: #b08d3e;
+  --c-alert: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-concrete: #12161c;
+    --c-panel: #1b212a;
+    --c-ink: #e6eaf0;
+    --c-muted: #9aa6b8;
+    --c-line: #2e3744;
+    --c-edge: #66748a;
+    --c-cable: #6ea0ff;
+    --c-oncable: #0b1220;
+    --c-led: #4cd66e;
+    --c-brass: #d2ae63;
+    --c-alert: #ff8a80;
+  }
+}
+
+@theme inline {
+  --color-concrete: var(--c-concrete);
+  --color-panel: var(--c-panel);
+  --color-ink: var(--c-ink);
+  --color-muted: var(--c-muted);
+  --color-line: var(--c-line);
+  --color-edge: var(--c-edge);
+  --color-cable: var(--c-cable);
+  --color-oncable: var(--c-oncable);
+  --color-led: var(--c-led);
+  --color-brass: var(--c-brass);
+  --color-alert: var(--c-alert);
+  --font-serif: "Literata", Charter, "Bitstream Charter", Georgia, serif;
+  --font-mono: "Martian Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: light dark;
+  }
+  body {
+    line-height: 1.6;
+  }
+  :focus-visible {
+    outline: 3px solid var(--c-cable);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex cursor-pointer items-center justify-center rounded border border-edge bg-panel px-4 py-2 font-semibold text-ink no-underline hover:bg-concrete;
+  }
+  .btn-primary {
+    @apply border-transparent bg-cable text-oncable hover:bg-cable hover:opacity-90;
+  }
+  .btn-quiet {
+    @apply border-transparent bg-transparent px-2 py-1 font-normal text-muted underline underline-offset-4 hover:bg-transparent hover:text-alert;
+  }
+  .field {
+    @apply block w-full rounded border border-edge bg-panel px-3 py-2 text-ink;
+  }
+  .tray {
+    @apply overflow-x-auto rounded border border-line bg-panel px-4 py-3 font-mono text-sm;
+  }
+  .notice {
+    @apply rounded border-l-4 border-alert bg-panel px-4 py-3 text-ink;
+  }
+
+  /* Passos numerados: a sequência é real, então o número vem da lista. */
+  .steps {
+    counter-reset: step;
+  }
+  .steps > li::before {
+    counter-increment: step;
+    content: counter(step);
+    @apply mb-3 block font-mono text-3xl font-bold text-cable;
+  }
+
+  /* Lâmpada do painel: acesa quando o token está conectado. */
+  .lamp {
+    @apply block size-3 rounded-full border border-edge bg-concrete;
+  }
+  .lamp-on {
+    @apply border-led bg-led;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--c-led) 28%, transparent);
+  }
+
+  /* O único momento animado da página: o cabo se liga ao abrir a landing. */
+  .cable {
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+    animation: draw 0.9s 0.3s ease-out forwards;
+  }
+  .led {
+    opacity: 0;
+    animation: light 0.2s 1.2s forwards;
+  }
+}
+
+@keyframes draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes light {
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cable {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+  .led {
+    animation: none;
+    opacity: 1;
+  }
+}

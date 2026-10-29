@@ -148,12 +148,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::db::Store;
     use crate::state::HttpCfg;
-    use crate::tokens::TokenStore;
 
     fn state(domain: Option<&str>) -> State {
         State {
-            tokens: TokenStore::new(std::env::temp_dir().as_path()),
+            store: Store::memory().unwrap(),
             tunnel_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port_range: 20000..=30000,
             http: domain.map(|d| HttpCfg {
@@ -162,6 +162,7 @@ mod tests {
             }),
             routes: Mutex::new(HashMap::new()),
             metrics: Arc::default(),
+            online: Mutex::default(),
         }
     }
 

@@ -21,8 +21,9 @@ curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh
 O `install.sh` detecta sistema e arquitetura, confere o SHA-256 e, se o
 repositório for privado, baixa pelo `gh` autenticado. No Windows, baixe
 `hbt-windows-x86_64.exe` da [página de releases](https://github.com/npbandeira/hbt/releases).
-Para publicar uma versão: suba a versão nos `Cargo.toml`, escreva
-`docs/releases/vX.Y.Z.md` e envie a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`);
+Para publicar uma versão: suba a versão nos `Cargo.toml`, mova o conteúdo de
+`[Unreleased]` do `CHANGELOG.md` para uma seção `## [X.Y.Z] - AAAA-MM-DD` (ela vira
+as notas da release) e envie a tag (`git tag vX.Y.Z && git push origin vX.Y.Z`);
 o workflow `release` compila e publica.
 
 ## Instalação a partir do código (scripts)
@@ -43,7 +44,7 @@ o workflow `release` compila e publica.
 | `scripts/deploy.sh` | sua máquina | build + envia por ssh + instala no VPS + cria um token exclusivo para esta máquina e configura o cliente |
 
 Depois do deploy, no VPS: `journalctl -u hbt-server -f` (logs) e
-`systemctl restart hbt-server`. Os tokens ficam em `/var/lib/hbt/tokens.json` (só o usuário `hbt` lê).
+`systemctl restart hbt-server`. Tokens e contas ficam em `/var/lib/hbt/hbt.db` (SQLite; só o usuário `hbt` lê).
 O deploy exige ssh com `sudo` no VPS. Libere as portas no firewall ao final
 (o script imprime os comandos; ele não mexe no firewall sozinho).
 
@@ -78,6 +79,36 @@ SHA-256 desse certificado for o `--fingerprint` configurado: é isso que impede
 alguém de se passar pelo servidor, e o tráfego vai criptografado (TLS 1.3).
 `hbt-server token create` já imprime o comando `hbt configure` completo. Apagar
 `cert.der`/`key.der` gera outra identidade e exige reconfigurar os clientes.
+
+**Entrar pelo site (cadastro e tokens, estilo ngrok):** com `--web-bind`, o servidor
+serve uma landing page, o cadastro (e-mail e senha) e um painel onde cada pessoa
+cria os próprios tokens e copia o comando `hbt configure ...` pronto. O `hbt`
+(cliente) não faz login: só guarda o token.
+
+```sh
+hbt-server serve --web-bind 127.0.0.1:8081 --web-url https://meuhbt.duckdns.org
+hbt-server user list                      # contas e quantos tokens cada uma tem
+hbt-server user disable ana@exemplo.com   # bloqueia e revoga TODOS os tokens dela
+```
+
+- **O site precisa de HTTPS** (tem senha e token). Sem domínio próprio, um nome grátis
+  do [DuckDNS](https://www.duckdns.org) (`meuhbt.duckdns.org` apontando para o IP do
+  VPS) serve; o Caddy emite o certificado sozinho. `Caddyfile`:
+  ```
+  meuhbt.duckdns.org {
+      reverse_proxy 127.0.0.1:8081
+  }
+  ```
+- `--signup closed` fecha o cadastro: só entram contas criadas por
+  `hbt-server user add <e-mail>` (a senha é gerada e mostrada uma vez). O padrão,
+  `open`, é como o ngrok; o abuso é limitado por `--max-tokens-per-user` (padrão 5),
+  por limite de tentativas por IP e pelo `user disable`.
+- Sem verificação de e-mail (exigiria SMTP): quem se cadastra não prova que o e-mail é seu.
+- As sessões ficam em memória: reiniciar o servidor desloga todos.
+- O CSS do site é gerado pelo Tailwind e fica commitado. Se mudar classes em
+  `server/src/web/`, rode `./scripts/build-css.sh` e commite o `server/assets/app.css`.
+- Quem já usava o `tokens.json` não precisa fazer nada: na primeira abertura os tokens
+  são importados para o banco (e o arquivo vira `tokens.json.migrated`).
 
 **2. Na sua máquina, uma vez só:**
 
@@ -135,9 +166,9 @@ Cliente e servidor precisam falar a mesma versão do protocolo: ao atualizar o
 | Pasta | Conteúdo |
 |---|---|
 | `proto/` | protocolo (mensagens, framing), configuração QUIC/TLS (`quic.rs`) e multiplexação (`mux.rs`), compartilhados |
-| `server/` | `hbt-server`: `cli.rs` (args/tokens), `serve.rs` (listeners), `control.rs` (handshake/registro), `tunnel.rs` (sessão, TCP/UDP), `http_edge.rs` (roteamento por Host), `state.rs`, `tokens.rs`, `metrics.rs` |
+| `server/` | `hbt-server`: `cli.rs` (args, tokens, contas), `serve.rs` (listeners), `control.rs` (handshake/registro), `tunnel.rs` (sessão, TCP/UDP), `http_edge.rs` (roteamento por Host), `db.rs` (SQLite: tokens e contas), `accounts.rs` (senhas), `web/` (site: landing, cadastro, painel), `state.rs`, `tokens.rs`, `metrics.rs` |
 | `client/` | `hbt`: `cli.rs` (args/credenciais), `session.rs` (conexão, reconexão, heartbeat), `forward.rs` (repasse TCP/UDP), `config.rs` |
-| `e2e/` | testes ponta a ponta com os binários reais, por área: `tunnels`, `http`, `auth`, `configure` (helpers em `tests/common/`) |
+| `e2e/` | testes ponta a ponta com os binários reais, por área: `tunnels`, `http`, `auth`, `configure`, `web` (helpers em `tests/common/`) |
 | `bench/` | `hbt-udpbench`, usado pelo teste de carga |
 | `scripts/` | build, deploy, instalação, demo e teste de carga |
 | `docker/`, `observability/` | stack de teste de carga e Prometheus/Grafana |

@@ -10,14 +10,18 @@
 #   --control-bind A    porta de controle (UDP)   (padrão 0.0.0.0:7000)
 #   --port-range A-B    portas públicas tcp/udp   (padrão 20000-30000)
 #   --metrics-bind A    métricas Prometheus       (padrão 127.0.0.1:9477; "" desliga)
+#   --web-bind A        site (cadastro e painel de tokens), ex.: 127.0.0.1:8081; mantém o anterior se omitido
+#   --web-url U         URL pública do site, ex.: https://meuhbt.duckdns.org (o site precisa de HTTPS: Caddy/nginx na frente)
+#   --signup S          open (padrão) ou closed: quem pode criar conta no site
 #
 # Idempotente: rodar de novo atualiza o binário e reinicia, mantendo os tokens.
-# Os tokens dos clientes ficam em /var/lib/hbt/tokens.json e são gerenciados com
+# Tokens e contas ficam em /var/lib/hbt/hbt.db (SQLite) e são gerenciados com
 #   sudo -u hbt hbt-server token create|list|revoke
+#   sudo -u hbt hbt-server user add|list|reset|disable|enable|remove
 # Variável DESTDIR (como em pacotes) instala numa árvore de teste sem tocar no sistema.
 set -euo pipefail
 
-BIN="" DOMAIN="" HTTP_BIND="0.0.0.0:80" CONTROL_BIND="0.0.0.0:7000" RANGE="20000-30000" METRICS_BIND="127.0.0.1:9477"
+BIN="" DOMAIN="" HTTP_BIND="0.0.0.0:80" CONTROL_BIND="0.0.0.0:7000" RANGE="20000-30000" METRICS_BIND="127.0.0.1:9477" WEB_BIND="" WEB_URL="" SIGNUP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bin) BIN="$2"; shift 2 ;;
@@ -26,7 +30,10 @@ while [[ $# -gt 0 ]]; do
     --control-bind) CONTROL_BIND="$2"; shift 2 ;;
     --port-range) RANGE="$2"; shift 2 ;;
     --metrics-bind) METRICS_BIND="$2"; shift 2 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    --web-bind) WEB_BIND="$2"; shift 2 ;;
+    --web-url) WEB_URL="$2"; shift 2 ;;
+    --signup) SIGNUP="$2"; shift 2 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "opção desconhecida: $1 (veja --help)" >&2; exit 2 ;;
   esac
 done
@@ -58,6 +65,10 @@ UNIT="$DESTDIR/etc/systemd/system/hbt-server.service"
 # Lê um valor já existente no env (para manter o domínio em reinstalações).
 existing() { [[ -f "$ENV_FILE" ]] && sed -n "s/^$1=//p" "$ENV_FILE" | head -n1 || true; }
 [[ -n "$DOMAIN" ]] || DOMAIN="$(existing HBT_DOMAIN)"
+[[ -n "$WEB_BIND" ]] || WEB_BIND="$(existing HBT_WEB_BIND)"
+[[ -n "$WEB_URL" ]] || WEB_URL="$(existing HBT_WEB_URL)"
+[[ -n "$SIGNUP" ]] || SIGNUP="$(existing HBT_SIGNUP)"
+case "${SIGNUP:-open}" in open|closed) ;; *) die "--signup deve ser open ou closed" ;; esac
 
 if [[ -z "$DESTDIR" ]]; then
   echo "==> usuário de sistema 'hbt' (sem shell, sem home)"
@@ -67,7 +78,7 @@ fi
 echo "==> binário em $BIN_DST"
 install -D -m 0755 "$BIN" "$BIN_DST"
 
-echo "==> dados em $DATA_DIR (tokens; só o usuário hbt acessa)"
+echo "==> dados em $DATA_DIR (tokens e contas; só o usuário hbt acessa)"
 if [[ -z "$DESTDIR" ]]; then
   install -d -m 0750 -o hbt -g hbt "$DATA_DIR"
 else
@@ -81,6 +92,9 @@ install -d -m 0755 "$ENV_DIR"
   echo "HBT_HTTP_BIND=$HTTP_BIND"
   echo "HBT_DATA_DIR=/var/lib/hbt"
   if [[ -n "$METRICS_BIND" ]]; then echo "HBT_METRICS_BIND=$METRICS_BIND"; fi
+  [[ -n "$WEB_BIND" ]] && echo "HBT_WEB_BIND=$WEB_BIND"
+  [[ -n "$WEB_URL" ]] && echo "HBT_WEB_URL=$WEB_URL"
+  [[ -n "$SIGNUP" ]] && echo "HBT_SIGNUP=$SIGNUP"
 } > "$ENV_FILE"
 
 echo "==> serviço systemd"
@@ -103,7 +117,7 @@ LimitNOFILE=65536
 # Permite escutar na porta 80 sem rodar como root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# Endurecimento: o serviço só precisa de rede e do diretório de tokens.
+# Endurecimento: o serviço só precisa de rede e do diretório de dados.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/hbt
@@ -138,9 +152,20 @@ else
 fi
 [[ -n "$METRICS_BIND" ]] && echo "  Métricas: http://$METRICS_BIND/metrics  (na sua máquina: ./scripts/observability.sh up <host-ssh>)"
 echo
+# Gera o certificado na primeira instalação (como o usuário hbt, dono do diretório).
+if [[ -n "$DESTDIR" ]]; then
+  FINGERPRINT="$("$BIN_DST" --data-dir "$DATA_DIR" fingerprint)"
+else
+  FINGERPRINT="$(sudo -u hbt "$BIN_DST" fingerprint)"
+fi
 echo "Fingerprint do servidor (cada cliente confere este valor; vai no --fingerprint):"
-echo "  $(sudo -u hbt hbt-server fingerprint)"
+echo "  $FINGERPRINT"
 echo
+if [[ -n "$WEB_BIND" ]]; then
+  echo "Site: $WEB_BIND (cadastro ${SIGNUP:-open}). Ele tem senha e token: ponha Caddy/nginx com HTTPS na frente."
+  echo "  Contas: sudo -u hbt hbt-server user list|add|reset|disable|enable|remove"
+  echo
+fi
 echo "Crie um token para cada cliente (mostrado uma única vez):"
 echo "  sudo -u hbt hbt-server token create meu-notebook"
 echo "  sudo -u hbt hbt-server token list"

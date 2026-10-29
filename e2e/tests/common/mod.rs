@@ -275,3 +275,192 @@ pub fn hbt_output(home: &Path, args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+
+// ------------------------------------------------------------- site (web)
+
+pub struct Resp {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Resp {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `nome=valor` do primeiro `Set-Cookie` (sem os atributos).
+    pub fn cookie(&self) -> Option<String> {
+        self.header("set-cookie")
+            .and_then(|c| c.split(';').next())
+            .filter(|c| !c.ends_with('='))
+            .map(str::to_owned)
+    }
+}
+
+/// Codifica um valor de formulário (`application/x-www-form-urlencoded`).
+pub fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+pub fn form(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Uma requisição HTTP/1.1 crua, `Connection: close`, e a resposta inteira.
+pub async fn http(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Resp {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if !body.is_empty() {
+        req.push_str(&format!(
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    timeout(Duration::from_secs(10), s.read_to_end(&mut raw))
+        .await
+        .expect("o site não respondeu")
+        .unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").expect("resposta sem cabeçalhos");
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    Resp {
+        status,
+        headers,
+        body: body.to_owned(),
+    }
+}
+
+/// Um navegador de mentira: guarda o cookie e manda `Origin` do próprio site.
+pub struct Browser {
+    pub port: u16,
+    pub cookie: Option<String>,
+}
+
+impl Browser {
+    pub fn new(port: u16) -> Browser {
+        Browser { port, cookie: None }
+    }
+
+    pub async fn send(&mut self, method: &str, path: &str, body: &str, htmx: bool) -> Resp {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        let mut h = vec![("Origin", origin.as_str())];
+        if htmx {
+            h.push(("HX-Request", "true"));
+        }
+        let cookie = self.cookie.clone();
+        if let Some(c) = &cookie {
+            h.push(("Cookie", c));
+        }
+        let r = http(self.port, method, path, &h, body).await;
+        if let Some(c) = r.cookie() {
+            self.cookie = Some(c);
+        }
+        r
+    }
+
+    pub async fn signup(&mut self, email: &str, password: &str) -> Resp {
+        self.send(
+            "POST",
+            "/signup",
+            &form(&[("email", email), ("password", password)]),
+            false,
+        )
+        .await
+    }
+
+    pub async fn login(&mut self, email: &str, password: &str) -> Resp {
+        self.send(
+            "POST",
+            "/login",
+            &form(&[("email", email), ("password", password)]),
+            false,
+        )
+        .await
+    }
+
+    pub async fn create_token(&mut self, name: &str) -> Resp {
+        self.send("POST", "/tokens", &form(&[("name", name)]), true).await
+    }
+}
+
+/// O `hbt configure ...` que o painel mostra: (server, token, fingerprint).
+pub fn parse_configure(html: &str) -> (String, String, String) {
+    let start = html
+        .find("hbt configure")
+        .expect("comando de configuração na resposta");
+    let cmd = html[start..].split("</code>").next().unwrap();
+    let word_after = |flag: &str| {
+        cmd.split_once(flag)
+            .unwrap_or_else(|| panic!("falta {flag} em: {cmd}"))
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    (
+        word_after("--server "),
+        word_after("--token "),
+        word_after("--fingerprint "),
+    )
+}
+
+impl Fixture {
+    /// Servidor com o site ligado; devolve (fixture, porta do site).
+    pub async fn with_web(range: &str, extra: &[&str]) -> (Fixture, u16) {
+        let web = free_port();
+        let web_bind = format!("127.0.0.1:{web}");
+        let mut args = vec!["--web-bind", web_bind.as_str()];
+        args.extend_from_slice(extra);
+        let fx = Fixture::start(range, &args);
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", web)).await.is_ok() {
+                return (fx, web);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("o site não subiu");
+    }
+
+    /// `hbt-server <args...>` (sem o prefixo `token`), como o admin faria.
+    pub fn admin(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(bin_dir().join("hbt-server"))
+            .arg("--data-dir")
+            .arg(&self.dir)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+}

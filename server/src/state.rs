@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use hbt_proto::mux::Opener;
 
+use crate::db::Store;
 use crate::metrics::Metrics;
-use crate::tokens::TokenStore;
 
 /// Estado compartilhado entre todos os tasks.
 ///
@@ -18,7 +18,7 @@ use crate::tokens::TokenStore;
 /// entre `tokio::spawn`s, que exigem `'static` (não podem emprestar do
 /// escopo que os criou).
 pub struct State {
-    pub tokens: TokenStore,
+    pub store: Store,
     pub tunnel_ip: IpAddr,
     pub port_range: RangeInclusive<u16>,
     /// Configuração do edge HTTP (None = desabilitado).
@@ -34,6 +34,46 @@ pub struct State {
     /// um `spawn` dá erro de compilação.
     pub routes: Mutex<HashMap<String, Opener>>,
     pub metrics: Arc<Metrics>,
+    /// token id -> sessões de túnel abertas agora (o painel do site mostra o LED).
+    pub online: Mutex<HashMap<String, usize>>,
+}
+
+impl State {
+    /// Marca o token como conectado até o guard cair.
+    pub fn mark_online(self: &Arc<Self>, token_id: &str) -> OnlineGuard {
+        *self
+            .online
+            .lock()
+            .unwrap()
+            .entry(token_id.to_owned())
+            .or_default() += 1;
+        OnlineGuard {
+            state: self.clone(),
+            token_id: token_id.to_owned(),
+        }
+    }
+
+    pub fn is_online(&self, token_id: &str) -> bool {
+        self.online.lock().unwrap().contains_key(token_id)
+    }
+}
+
+/// Desmarca o token ao acabar a sessão (RAII, como `RouteGuard`).
+pub struct OnlineGuard {
+    state: Arc<State>,
+    token_id: String,
+}
+
+impl Drop for OnlineGuard {
+    fn drop(&mut self) {
+        let mut online = self.state.online.lock().unwrap();
+        if let Some(n) = online.get_mut(&self.token_id) {
+            *n -= 1;
+            if *n == 0 {
+                online.remove(&self.token_id);
+            }
+        }
+    }
 }
 
 pub struct HttpCfg {

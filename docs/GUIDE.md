@@ -161,16 +161,45 @@ local: se um peer só envia e o serviço nunca responde, a sessão é recriada
 **Tokens por cliente (`<id>.<segredo>`)**
 O `id` (público) localiza o registro; o `segredo` (256 bits) prova identidade
 via desafio HMAC. O servidor guarda `SHA-256("hbt-token-v1:"+segredo)` e nunca o
-segredo cru; o cliente recalcula a mesma chave. Cada token tem nome, data e
-limites opcionais (portas/subdomínios), e pode ser revogado sozinho: o servidor
-relê o arquivo a cada autenticação e a cada heartbeat, então a revogação derruba
-sessões ativas em até ~10s. Um id desconhecido recebe o desafio como qualquer
+segredo cru; o cliente recalcula a mesma chave. Cada token tem nome, data,
+dono (a conta do site que o criou, se houver) e limites opcionais
+(portas/subdomínios), e pode ser revogado sozinho: o servidor consulta o banco a
+cada autenticação e a cada heartbeat, então a revogação derruba sessões ativas
+em até ~10s. Um id desconhecido recebe o desafio como qualquer
 outro e falha com a mesma mensagem (evita descobrir quais ids existem).
-*Limite honesto:* quem copia `tokens.json` tem as chaves e consegue responder
+*Limite honesto:* quem copia o `hbt.db` tem as chaves e consegue responder
 ao desafio ("pass-the-hash"): o servidor ainda guarda a chave derivada, não um
 hash dela. Agora que o canal é TLS, essa migração é possível; o formato já está
-pronto. Armazenamento em JSON atende dezenas de
-clientes; para muitos milhares, use SQLite.
+pronto.
+
+**SQLite (e não JSON) para tokens e contas**
+O servidor consulta o token a cada handshake e a cada heartbeat (10 s) de cada
+sessão, e dois processos escrevem (o servidor, pelo site, e o `hbt-server
+token|user ...` do admin). Com um `tokens.json` cada consulta relia e reparseava o
+arquivo inteiro: medido com 10 000 tokens (2,3 MB), 8,4 ms por consulta contra 8,9
+µs no SQLite (`cargo test -p hbt-server --release -- --ignored --nocapture
+heartbeat_lookup`). Com milhares de sessões isso seria uma CPU inteira de um VPS de
+1 vCPU, no worker do Tokio (parando o relay, inclusive o UDP). Além disso, duas
+escritas simultâneas no JSON perdiam uma; no SQLite (WAL + `busy_timeout`) o banco
+serializa entre processos. `rusqlite` (embutido, `bundled`) e não `sqlx`: o `sqlx`
+usa o mesmo SQLite em C por baixo, seu async é um wrapper sobre threads e as macros
+`query!` pedem banco ou metadados no build. Custo: o build precisa de compilador C
+(o `ring` do QUIC já exigia) e, para o alvo musl, de `musl-gcc`.
+
+**O site: contas, cotas e defesas**
+HTML no servidor (`maud`, que escapa tudo), trechos trocados pelo htmx e CSS do
+Tailwind commitado. Cadastro aberto como o do ngrok, então o abuso é contido por:
+cota de tokens por conta (`--max-tokens-per-user`), limite de tentativas de login
+(10 por 15 min) e de cadastro (5 por hora) por IP, `hbt-server user disable`
+(bloqueia e revoga todos os tokens numa transação) e `--signup closed`. A senha é
+argon2id; um login de conta inexistente verifica contra um hash falso (mesma
+demora, mesma mensagem), e só 2 hashes rodam ao mesmo tempo (cada um usa ~19 MiB).
+A sessão é um id aleatório em memória (cookie `HttpOnly; SameSite=Strict`, `Secure`
+atrás de HTTPS); a conta é relida do banco a cada requisição, então `user disable`
+vale na hora mesmo sendo outro processo. CSRF: além do `SameSite`, o `Origin` precisa
+ser o próprio site e as ações do painel exigem o cabeçalho `HX-Request`. O CSP só
+aceita arquivos do próprio site (sem script nem estilo inline). Não há verificação
+de e-mail (exigiria SMTP) e as sessões não sobrevivem a reinício.
 
 **Autenticação HMAC dentro de TLS**
 O HMAC prova que o cliente conhece o segredo e impede replay; o canal QUIC/TLS

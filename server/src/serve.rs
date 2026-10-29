@@ -8,15 +8,16 @@ use hbt_proto::quic;
 use tokio::net::{lookup_host, TcpListener};
 use tracing::{debug, info, warn};
 
-use crate::cli::ServeArgs;
+use crate::cli::{ServeArgs, Signup};
 use crate::control::handle_conn;
+use crate::db::Store;
 use crate::http_edge::http_edge;
 use crate::identity::Identity;
 use crate::metrics;
 use crate::state::{HttpCfg, State};
-use crate::tokens::TokenStore;
+use crate::web::{self, WebCfg};
 
-pub async fn serve(args: ServeArgs, tokens: TokenStore, identity: Identity) -> Result<()> {
+pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<()> {
     let http_listener = match args.domain {
         Some(_) => Some(
             TcpListener::bind(&args.http_bind)
@@ -34,12 +35,13 @@ pub async fn serve(args: ServeArgs, tokens: TokenStore, identity: Identity) -> R
     };
 
     let state = Arc::new(State {
-        tokens,
+        store,
         tunnel_ip: args.tunnel_ip,
         port_range: args.port_range,
         http,
         routes: Mutex::new(HashMap::new()),
         metrics: Arc::default(),
+        online: Mutex::default(),
     });
 
     let control_addr = lookup_host(&args.control_bind)
@@ -57,9 +59,9 @@ pub async fn serve(args: ServeArgs, tokens: TokenStore, identity: Identity) -> R
         identity.fingerprint(),
         state.port_range
     );
-    match state.tokens.find("").await {
+    match state.store.find("").await {
         Err(e) => bail!("não consigo ler os tokens: {e:#}"),
-        Ok(_) if state.tokens.load()?.is_empty() => warn!(
+        Ok(_) if args.web_bind.is_none() && state.store.load()?.is_empty() => warn!(
             "nenhum token cadastrado: ninguém consegue conectar. Crie com: hbt-server token create <nome>"
         ),
         Ok(_) => {}
@@ -71,6 +73,32 @@ pub async fn serve(args: ServeArgs, tokens: TokenStore, identity: Identity) -> R
             .with_context(|| format!("não consegui abrir {bind}"))?;
         info!("métricas em http://{bind}/metrics");
         tokio::spawn(metrics::serve(l, state.metrics.clone()));
+    }
+
+    if let Some(bind) = &args.web_bind {
+        let l = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("não consegui abrir {bind}"))?;
+        info!(
+            "site em http://{bind} (cadastro {}; até {} tokens por conta)",
+            if args.signup == Signup::Open {
+                "aberto"
+            } else {
+                "fechado"
+            },
+            args.max_tokens_per_user
+        );
+        let web = web::new(
+            state.clone(),
+            WebCfg {
+                url: args.web_url.clone(),
+                signup_open: args.signup == Signup::Open,
+                max_tokens: args.max_tokens_per_user,
+                control_port: control_addr.port(),
+                fingerprint: identity.fingerprint(),
+            },
+        );
+        tokio::spawn(web::serve(l, web));
     }
 
     if let Some(l) = http_listener {
