@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-29
+
+Só a interface do site mudou: o protocolo e o banco são os mesmos da 2.0.0, então servidor e clientes 2.0.0 continuam compatíveis. Basta atualizar o `hbt-server`.
+
 ### Mudou (interface do site)
 
 - **Site redesenhado** com a skill de design "tasteskill" (direção *One motif*): a porta numerada do hbt vira o disco magenta, que recorre como forma dos botões e da marca. Landing nova com um construtor de comando funcional (tipo de túnel e porta local geram o `hbt ...` e o endereço público), os três tipos de túnel, os quatro passos, os números medidos (perda de 0,05 % a 50 mil pacotes UDP por segundo, p99 de 3,7 ms, token conferido em 8,9 µs, com as condições do teste escritas) e o cadastro de verdade no fechamento.
@@ -12,6 +16,8 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 - Fontes trocadas para League Spartan e Figtree, embutidas no binário (33 KB, antes 75 KB); a monoespaçada ficou só nos blocos de código, usando a do sistema.
 - A landing não oferece cadastro quando o servidor roda com `--signup closed`.
 - O tema escuro automático foi removido: a paleta "céu e areia" tem um tema só.
+- O nome da marca na interface é **HBT**, em caixa alta (logotipo, título da aba e textos); comandos e binários seguem em minúsculas. O logotipo do rodapé é uma imagem com o nome "HBT" para leitores de tela.
+- A skill de design `design-taste-frontend` passou a ser versionada em `.agents/` (com o link em `.claude/skills/`).
 
 ## [2.0.0] - 2026-10-29
 
@@ -99,7 +105,8 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/npbandeira/hbt/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/npbandeira/hbt/compare/v0.1.1...v2.0.0
 [0.1.1]: https://github.com/npbandeira/hbt/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/npbandeira/hbt/releases/tag/v0.1.0
