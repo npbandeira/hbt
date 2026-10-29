@@ -45,7 +45,7 @@ fn shell(title: &str, nav: Nav<'_>, body: &Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="htmx-config" content=(HTMX_CONFIG);
-                title { (title) " · hbt" }
+                title { (title) " · HBT" }
                 link rel="stylesheet" href=(assets::url("app.css"));
                 // Sem defer de propósito: marca html.js antes da primeira pintura (as
                 // entradas só escondem o conteúdo quando há JavaScript para mostrá-lo).
@@ -54,9 +54,9 @@ fn shell(title: &str, nav: Nav<'_>, body: &Markup) -> Markup {
             }
             body class="min-h-screen" {
                 header class="frame flex items-center justify-between gap-4 py-5" {
-                    a href="/" class="flex items-center gap-2 font-display text-lead font-bold tracking-tighter" aria-label="hbt, página inicial" {
+                    a href="/" class="flex items-center gap-2 font-display text-lead font-bold tracking-tighter" aria-label="HBT, página inicial" {
                         span class="disc size-4" aria-hidden="true" {}
-                        "hbt"
+                        "HBT"
                     }
                     nav class="flex items-center gap-3 sm:gap-6" aria-label="Principal" {
                         @match nav {
@@ -113,7 +113,7 @@ pub fn landing(signup_open: bool) -> Markup {
                     div {
                         h1 class="rise max-w-[14ch] text-display" { "Seu localhost, na internet." }
                         p class="rise d1 mt-6 max-w-[40ch] text-lead" {
-                            "Crie uma conta, gere um token e cole um comando. O hbt abre a porta no servidor e leva o tráfego até o seu computador."
+                            "Crie uma conta, gere um token e cole um comando. O HBT abre a porta no servidor e leva o tráfego até o seu computador."
                         }
                         div class="rise d2 mt-8 flex flex-wrap gap-3" {
                             a href=(cta.1) class="btn" { (cta.0) }
@@ -182,7 +182,7 @@ pub fn landing(signup_open: bool) -> Markup {
                     }
                     div id="instalar" class="mt-24 grid scroll-mt-8 gap-10 lg:grid-cols-[1fr_1.1fr] lg:items-start" {
                         div {
-                            h3 class="reveal max-w-[14ch] text-head" { "Instale o hbt." }
+                            h3 class="reveal max-w-[14ch] text-head" { "Instale o HBT." }
                             p class="reveal d1 mt-4 max-w-[44ch]" {
                                 "Linux e macOS. No Windows, baixe o " code { "hbt-windows-x86_64.exe" } " na página de releases do projeto."
                             }
@@ -261,10 +261,10 @@ pub fn landing(signup_open: bool) -> Markup {
                             a href="https://github.com/npbandeira/hbt/releases" class="underline underline-offset-4" { "Releases" }
                         }
                     }
-                    div class="mark mt-12" aria-hidden="true" {
-                        span class="h-[88%] bg-sun" { "h" }
-                        span class="h-[100%] bg-sky" { "b" }
-                        span class="h-[72%] bg-accent !text-accent-ink" { "t" }
+                    div class="mark mt-12" role="img" aria-label="HBT" {
+                        span class="bg-sun" { "H" }
+                        span class="bg-sky" { "B" }
+                        span class="bg-accent !text-accent-ink" { "T" }
                     }
                 }
                 p class="frame pb-6 pt-4 text-sm" { "hbt-server " (env!("CARGO_PKG_VERSION")) }
@@ -402,7 +402,7 @@ pub fn dashboard(email: &str, tokens: &[TokenRecord], online: &[bool]) -> Markup
                     }
                     section class="rounded-2xl bg-ink p-6 text-sky sm:p-8 lg:col-start-1 lg:row-start-2" {
                         h2 class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Configurar um computador" }
-                        p class="mt-4 font-semibold" { "1. Instale o hbt" }
+                        p class="mt-4 font-semibold" { "1. Instale o HBT" }
                         pre class="code mt-2" { code { (INSTALL) } }
                         p class="mt-4 font-semibold" { "2. Cole o comando do token" }
                         p class="mt-1" { "Ele aparece ao criar o token. Depois é só abrir o túnel, por exemplo " code { "hbt http 3000" } "." }

@@ -181,15 +181,21 @@
 
   /* Marca em blocos (rodapé): cada letra recortada do seu retângulo. */
   .mark {
+    /* Três blocos de mesma altura ocupando a largura; as capitulares enormes
+       (a altura da letra é ~85 % do bloco) assentam na base, como a marca em minúsculas. */
+    --mark-h: clamp(10rem, 26vw, 24rem);
+    height: var(--mark-h);
     @apply flex items-end gap-[0.6vw];
     font-family: var(--font-display);
     font-weight: 700;
-    line-height: 0.8;
+    line-height: 1;
     letter-spacing: -0.04em;
   }
   .mark span {
-    @apply flex flex-1 items-end justify-center pb-[0.5vw] text-ink;
-    font-size: clamp(8rem, 30vw, 24rem);
+    @apply flex h-full flex-1 items-end justify-center overflow-hidden text-ink;
+    font-size: calc(var(--mark-h) * 1.18);
+    line-height: 0.74;
+    padding-bottom: calc(var(--mark-h) * 0.07);
   }
 
   /* ------------------------------------------------------------ movimento */
