@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use hbt_proto::mux::{self, Mode, MuxStream, Opener, StreamKind};
+use hbt_proto::mux::{recv_udp, send_udp, MuxStream, Opener, StreamKind};
 use hbt_proto::*;
+use quinn::{Connection, SendDatagramError};
 use tokio::io::{copy_bidirectional, BufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{interval, timeout};
 use tracing::{debug, info, warn};
 
@@ -18,23 +19,18 @@ use crate::state::State;
 use crate::tokens::TokenRecord;
 
 /// Vive enquanto o cliente estiver conectado.
+///
+/// `ctl` é o stream do handshake, que segue como stream de controle:
+/// heartbeats nos dois sentidos. Todo o resto da conexão (`conn`) é aberto
+/// por demanda: streams (via `opener`) e datagramas.
 pub async fn run_tunnel(
-    stream: TcpStream,
+    ctl: MuxStream,
+    conn: Connection,
     state: Arc<State>,
     bound: Bound,
     record: TokenRecord,
     opener: Opener,
-    requests: mux::Requests,
 ) -> Result<()> {
-    // Daqui em diante a conexão é uma sessão multiplexada: um task a "gira"
-    // (proto/src/mux.rs) e todos os outros só abrem streams nela.
-    let mut session = AbortOnDrop(tokio::spawn(async move {
-        if let Err(e) = mux::run(stream, Mode::Server, requests, None).await {
-            debug!("sessão: {e}");
-        }
-    }));
-    // O primeiro stream é o de controle: heartbeats nos dois sentidos.
-    let ctl = opener.open(StreamKind::Control).await?;
     let (rd, mut wr) = tokio::io::split(ctl);
     let mut rd = BufReader::new(rd);
 
@@ -68,7 +64,13 @@ pub async fn run_tunnel(
                 opener,
             ))))
         }
-        Bound::Udp(s) => tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(s, state.clone(), opener)))),
+        Bound::Udp(s) => {
+            tunnel = Some(AbortOnDrop(tokio::spawn(udp_tunnel(
+                s,
+                state.clone(),
+                conn.clone(),
+            ))))
+        }
         Bound::Http(guard) => _route = Some(guard),
     }
 
@@ -87,13 +89,14 @@ pub async fn run_tunnel(
             }
             _ = &mut reader.0 => break,
             _ = tunnel_done(&mut tunnel) => break,
-            _ = &mut session.0 => break,
+            _ = conn.closed() => break,
         }
     }
     info!("túnel de '{}' encerrado", record.name);
-    // Ao sair, `reader`, `tunnel` e `session` sofrem Drop => tasks abortados
-    // => o listener é fechado, a porta pública liberada e a conexão com o
-    // cliente cai (derrubando todos os streams). Isso é RAII.
+    // Ao sair, `reader` e `tunnel` sofrem Drop => tasks abortados => o
+    // listener é fechado e a porta pública liberada. O close derruba a
+    // conexão com o cliente (e todos os streams). Isso é RAII.
+    conn.close(0u32.into(), b"tunnel closed");
     Ok(())
 }
 
@@ -154,53 +157,40 @@ async fn tcp_accept_loop(listener: TcpListener, state: Arc<State>, opener: Opene
     }
 }
 
-/// UDP: um único stream da sessão carrega TODOS os datagramas do túnel.
-async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, opener: Opener) {
-    let data = match timeout(Duration::from_secs(10), opener.open(StreamKind::Udp)).await {
-        Ok(Ok(s)) => s,
-        _ => {
-            warn!("não consegui abrir o stream UDP até o cliente");
-            return;
-        }
-    };
-    let (rd, wr) = tokio::io::split(data);
+/// UDP: cada datagrama público vira um datagrama QUIC (sem ordem nem
+/// retransmissão) e vice-versa.
+async fn udp_tunnel(socket: UdpSocket, state: Arc<State>, conn: Connection) {
     let socket = Arc::new(socket);
 
     // Dois sentidos concorrentes no mesmo task: o primeiro que terminar
     // (erro/fechamento) encerra o outro, porque o `select!` descarta o perdedor.
     tokio::select! {
-        r = udp_to_stream(socket.clone(), wr, &state.metrics) => debug!("udp->stream: {r:?}"),
-        r = stream_to_udp(socket, BufReader::new(rd), &state.metrics) => debug!("stream->udp: {r:?}"),
+        r = udp_to_client(socket.clone(), &conn, &state.metrics) => debug!("udp->cliente: {r:?}"),
+        r = client_to_udp(socket, &conn, &state.metrics) => debug!("cliente->udp: {r:?}"),
     }
 }
 
-async fn udp_to_stream(
-    socket: Arc<UdpSocket>,
-    mut wr: tokio::io::WriteHalf<MuxStream>,
-    metrics: &Metrics,
-) -> io::Result<()> {
+async fn udp_to_client(socket: Arc<UdpSocket>, conn: &Connection, metrics: &Metrics) -> io::Result<()> {
     let mut buf = vec![0u8; 65535];
     loop {
         let (n, peer) = socket.recv_from(&mut buf).await?;
         metrics.udp_in(n);
-        write_msg(
-            &mut wr,
-            &UdpFrame {
-                peer,
-                data: buf[..n].to_vec(),
-            },
-        )
-        .await?;
+        let frame = UdpFrame {
+            peer,
+            data: buf[..n].to_vec(),
+        };
+        match send_udp(conn, &frame) {
+            Ok(()) => {}
+            Err(SendDatagramError::ConnectionLost(e)) => return Err(io::Error::other(e)),
+            // Maior que o MTU do caminho: descartado, como um roteador faria.
+            Err(e) => debug!("datagrama de {peer} ({n}B) descartado: {e}"),
+        }
     }
 }
 
-async fn stream_to_udp(
-    socket: Arc<UdpSocket>,
-    mut rd: BufReader<tokio::io::ReadHalf<MuxStream>>,
-    metrics: &Metrics,
-) -> io::Result<()> {
+async fn client_to_udp(socket: Arc<UdpSocket>, conn: &Connection, metrics: &Metrics) -> io::Result<()> {
     loop {
-        let f: UdpFrame = read_msg(&mut rd).await?;
+        let f = recv_udp(conn).await.map_err(io::Error::other)?;
         socket.send_to(&f.data, f.peer).await?;
         metrics.udp_out(f.data.len());
     }

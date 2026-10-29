@@ -2,17 +2,18 @@
 
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::identity;
 use crate::tokens::{self, TokenStore};
 
 #[derive(Parser)]
 #[command(version, about = "hbt reverse tunnel server")]
 pub struct Cli {
-    /// Diretório de dados (guarda tokens.json). Precisa ser gravável.
+    /// Diretório de dados (guarda tokens.json e a identidade TLS). Precisa ser gravável.
     #[arg(long, env = "HBT_DATA_DIR", default_value = "/var/lib/hbt", global = true)]
     pub data_dir: PathBuf,
 
@@ -24,6 +25,9 @@ pub struct Cli {
 pub enum Command {
     /// Roda o servidor.
     Serve(ServeArgs),
+    /// Mostra o fingerprint do certificado do servidor (gera o certificado se não existir).
+    /// É o valor que o cliente confere em `hbt configure --fingerprint`.
+    Fingerprint,
     /// Gerencia os tokens dos clientes (valem imediatamente, sem reiniciar).
     Token {
         #[command(subcommand)]
@@ -55,7 +59,7 @@ pub enum TokenCmd {
 
 #[derive(Parser)]
 pub struct ServeArgs {
-    /// Endereço da porta de controle (onde os clientes se conectam).
+    /// Endereço da porta de controle (UDP/QUIC; onde os clientes se conectam).
     #[arg(long, default_value = "0.0.0.0:7000")]
     pub control_bind: String,
 
@@ -96,7 +100,7 @@ fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {
     Ok(a..=b)
 }
 
-pub fn token_admin(store: &TokenStore, cmd: TokenCmd) -> Result<()> {
+pub fn token_admin(store: &TokenStore, cmd: TokenCmd, data_dir: &Path) -> Result<()> {
     match cmd {
         TokenCmd::Create {
             name,
@@ -110,7 +114,10 @@ pub fn token_admin(store: &TokenStore, cmd: TokenCmd) -> Result<()> {
             } else {
                 println!("Token '{name}' criado. Guarde-o agora: ele não será mostrado de novo.\n");
                 println!("  {token}\n");
-                println!("No cliente:  hbt configure --server SEU_SERVIDOR --token {token}");
+                let fingerprint = identity::load_or_create(data_dir)?.fingerprint();
+                println!(
+                    "No cliente:  hbt configure --server SEU_SERVIDOR --token {token} --fingerprint {fingerprint}"
+                );
             }
         }
         TokenCmd::List => tokens::print_table(&store.load()?),

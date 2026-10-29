@@ -44,6 +44,7 @@ pub fn cmd(bin: &str) -> Command {
     let mut c = Command::new(bin_dir().join(bin));
     c.env_remove("HBT_TOKEN")
         .env_remove("HBT_SERVER")
+        .env_remove("HBT_FINGERPRINT")
         .env_remove("HBT_DOMAIN")
         .env_remove("HBT_DATA_DIR")
         .kill_on_drop(true); // sem isso, falha de teste deixaria processos órfãos
@@ -58,6 +59,8 @@ pub fn spawn_quiet(mut c: Command) -> Child {
 pub struct Fixture {
     pub dir: PathBuf,
     pub control: u16,
+    /// Fingerprint do certificado do servidor, que o cliente precisa conferir.
+    pub fingerprint: String,
     pub _server: Child,
 }
 
@@ -66,6 +69,15 @@ impl Fixture {
     pub fn start(range: &str, extra: &[&str]) -> Fixture {
         let control = free_port();
         let dir = std::env::temp_dir().join(format!("hbt-e2e-{}-{control}", std::process::id()));
+        // Gera o certificado antes do `serve`, para já termos o fingerprint.
+        let out = std::process::Command::new(bin_dir().join("hbt-server"))
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("fingerprint")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let fingerprint = String::from_utf8(out.stdout).unwrap().trim().to_owned();
         let mut c = cmd("hbt-server");
         c.args(["--data-dir"]).arg(&dir);
         c.args(["serve", "--control-bind", &format!("127.0.0.1:{control}")]);
@@ -74,6 +86,7 @@ impl Fixture {
         Fixture {
             dir,
             control,
+            fingerprint,
             _server: spawn_quiet(c),
         }
     }
@@ -104,7 +117,7 @@ impl Fixture {
 
     pub fn client(&self, token: &str, args: &[&str]) -> Command {
         let mut c = cmd("hbt");
-        c.args(["--server", &self.addr()])
+        c.args(["--server", &self.addr(), "--fingerprint", &self.fingerprint])
             .args(args)
             .env("HBT_TOKEN", token);
         c
@@ -258,6 +271,7 @@ pub fn hbt_output(home: &Path, args: &[&str]) -> std::process::Output {
         .env("XDG_CONFIG_HOME", home)
         .env_remove("HBT_TOKEN")
         .env_remove("HBT_SERVER")
+        .env_remove("HBT_FINGERPRINT")
         .output()
         .unwrap()
 }

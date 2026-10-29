@@ -18,13 +18,18 @@ pub struct Cli {
     #[arg(long, env = "HBT_TOKEN", hide_env_values = true, global = true)]
     pub token: Option<String>,
 
+    /// Fingerprint (SHA-256) do certificado do servidor, mostrado por
+    /// `hbt-server fingerprint` e por `hbt-server token create`.
+    #[arg(long, env = "HBT_FINGERPRINT", global = true)]
+    pub fingerprint: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Salva servidor e token para não precisar repeti-los (sem argumentos: mostra o atual).
+    /// Salva servidor, token e fingerprint para não precisar repeti-los (sem argumentos: mostra o atual).
     Configure,
     /// Expõe um servidor web local numa URL pública, ex: `hbt http 3000`.
     Http(HttpArgs),
@@ -52,14 +57,19 @@ pub struct PortArgs {
     pub remote_port: Option<u16>,
 }
 
-/// Servidor + token já resolvidos (flag > env > arquivo).
+/// Servidor + token + fingerprint já resolvidos (flag > env > arquivo).
 pub struct Conn {
     pub server: String,
+    /// Certificado aceito do servidor, já normalizado (64 hex minúsculos).
+    pub fingerprint: String,
     /// Parte pública do token: diz ao servidor "quem sou eu".
     pub token_id: String,
     /// Chave derivada do segredo, usada para assinar o desafio.
     pub key: [u8; 32],
 }
+
+const BAD_FINGERPRINT: &str =
+    "fingerprint inválido: são 64 dígitos hex (veja `hbt-server fingerprint` no servidor)";
 
 const BAD_TOKEN: &str = "token inválido: o formato é <id>.<segredo> (gerado por `hbt-server token create`)";
 
@@ -105,15 +115,19 @@ pub fn local_addr(target: &str) -> String {
     }
 }
 
-/// Usa as flags globais `--server`/`--token` do próprio `Cli`.
+/// Usa as flags globais `--server`/`--token`/`--fingerprint` do próprio `Cli`.
 pub fn configure(cli: &Cli) -> Result<()> {
     let mut cfg = config::load()?;
-    if cli.server.is_none() && cli.token.is_none() {
+    if cli.server.is_none() && cli.token.is_none() && cli.fingerprint.is_none() {
         println!("arquivo : {}", config::path()?.display());
         println!("server  : {}", cfg.server.as_deref().unwrap_or("(não definido)"));
         println!(
             "token   : {}",
             cfg.token.as_deref().map_or("(não definido)".into(), config::mask)
+        );
+        println!(
+            "fingerp.: {}",
+            cfg.fingerprint.as_deref().unwrap_or("(não definido)")
         );
         return Ok(());
     }
@@ -124,6 +138,9 @@ pub fn configure(cli: &Cli) -> Result<()> {
         // Falha cedo: melhor recusar agora do que descobrir na hora de conectar.
         parse_token(t).context(BAD_TOKEN)?;
         cfg.token = Some(t.trim().to_owned());
+    }
+    if let Some(f) = &cli.fingerprint {
+        cfg.fingerprint = Some(config::parse_fingerprint(f).context(BAD_FINGERPRINT)?);
     }
     let path = config::save(&cfg)?;
     println!("configuração salva em {}", path.display());
@@ -140,8 +157,12 @@ pub fn resolve(cli: &Cli) -> Result<Conn> {
         cli.token.clone().or(file.token).context(
             "token não definido: rode `hbt configure --server HOST --token TOKEN` (ou use --token)",
         )?;
+    let fingerprint = cli.fingerprint.clone().or(file.fingerprint).context(
+        "fingerprint não definido: rode `hbt configure --fingerprint FP` (o servidor mostra com `hbt-server fingerprint`)",
+    )?;
     let (token_id, secret) = parse_token(&token).context(BAD_TOKEN)?;
     Ok(Conn {
+        fingerprint: config::parse_fingerprint(&fingerprint).context(BAD_FINGERPRINT)?,
         server: config::with_default_port(&server),
         token_id: token_id.to_owned(),
         key: derive_key(secret),

@@ -16,6 +16,7 @@ async fn configure_saves_credentials_so_no_flags_are_needed() {
     let hbt = bin_dir().join("hbt");
     let ok = std::process::Command::new(&hbt)
         .args(["configure", "--server", &fx.addr(), "--token", &token])
+        .args(["--fingerprint", &fx.fingerprint])
         .env("XDG_CONFIG_HOME", &home)
         .env_remove("HBT_TOKEN")
         .env_remove("HBT_SERVER")

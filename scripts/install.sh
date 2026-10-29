@@ -3,7 +3,7 @@
 #
 #   Cliente (Linux/macOS), em ~/.local/bin:
 #     curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh
-#     curl -fsSL .../install.sh | sh -s -- --server-addr meu.vps --token ID.SEGREDO   # já configura
+#     curl -fsSL .../install.sh | sh -s -- --server-addr meu.vps --token ID.SEGREDO --fingerprint FP   # já configura
 #
 #   Servidor (Linux, serviço systemd; pede sudo):
 #     curl -fsSL .../install.sh | sh -s -- --server --domain tunnel.exemplo.com
@@ -12,7 +12,7 @@
 #   --server            instala o hbt-server (as demais opções vão para o install-server.sh)
 #   --version vX.Y.Z    versão específica (padrão: a mais recente)
 #   --dir DIR           onde pôr o cliente (padrão: ~/.local/bin)
-#   --server-addr HOST  e --token TOKEN: roda `hbt configure` depois de instalar
+#   --server-addr HOST, --token TOKEN e --fingerprint FP: roda `hbt configure` depois de instalar
 #
 # Repositório privado: o download direto não funciona sem login; o script usa
 # então o `gh` (GitHub CLI) já autenticado, se houver.
@@ -26,6 +26,7 @@ DIR="${HOME}/.local/bin"
 SERVER=0
 ADDR=""
 TOKEN=""
+FINGERPRINT=""
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[31merro:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -38,6 +39,7 @@ while [ $# -gt 0 ]; do
     --dir) DIR="$2"; shift 2 ;;
     --server-addr) ADDR="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
+    --fingerprint) FINGERPRINT="$2"; shift 2 ;;
     -h|--help) sed -n '2,22p' "$0" 2>/dev/null || echo "veja o cabeçalho de install.sh"; exit 0 ;;
     *) [ "$SERVER" = 1 ] && break; die "opção desconhecida: $1 (veja --help)" ;;
   esac
@@ -121,11 +123,12 @@ case ":$PATH:" in
   *) echo "    atenção: $DIR não está no PATH; adicione ao seu shell: export PATH=\"$DIR:\$PATH\"" ;;
 esac
 
-if [ -n "$ADDR" ] || [ -n "$TOKEN" ]; then
+if [ -n "$ADDR" ] || [ -n "$TOKEN" ] || [ -n "$FINGERPRINT" ]; then
   set --
   [ -n "$ADDR" ] && set -- "$@" --server "$ADDR"
   [ -n "$TOKEN" ] && set -- "$@" --token "$TOKEN"
+  [ -n "$FINGERPRINT" ] && set -- "$@" --fingerprint "$FINGERPRINT"
   "$DIR/hbt" configure "$@"
 else
-  echo "    próximo passo: hbt configure --server SEU.VPS --token ID.SEGREDO"
+  echo "    próximo passo: hbt configure --server SEU.VPS --token ID.SEGREDO --fingerprint FP"
 fi

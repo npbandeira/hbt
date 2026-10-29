@@ -43,22 +43,6 @@ async fn tcp_tunnel_echoes_multiple_connections() {
     }
 }
 
-/// Sockets TCP (fora o LISTEN) com `port` numa das pontas, em qualquer
-/// estado: estabelecidos, fechando ou em TIME_WAIT, de qualquer dos lados.
-fn tcp_sockets_on(port: u16) -> usize {
-    let table = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-    let port_of = |addr: &str| u16::from_str_radix(addr.rsplit(':').next().unwrap(), 16).ok();
-    table
-        .lines()
-        .skip(1)
-        .filter(|l| {
-            let f: Vec<&str> = l.split_whitespace().collect();
-            let on_port = port_of(f[1]) == Some(port) || port_of(f[2]) == Some(port);
-            on_port && f[3] != "0A" // 0A = LISTEN
-        })
-        .count()
-}
-
 #[tokio::test]
 async fn many_concurrent_connections_share_one_client_connection() {
     let public = free_port();
@@ -86,45 +70,6 @@ async fn many_concurrent_connections_share_one_client_connection() {
     }
     for t in tasks {
         timeout(Duration::from_secs(20), t).await.unwrap().unwrap();
-    }
-
-    // O ponto da multiplexação: na porta de controle existe só a conexão da
-    // sessão (2 sockets: o lado do cliente e o do servidor). No protocolo
-    // antigo haveria ~300 conexões de dados a mais, ou seus restos em TIME_WAIT.
-    if cfg!(target_os = "linux") {
-        assert_eq!(tcp_sockets_on(fx.control), 2);
-    }
-}
-
-#[tokio::test]
-async fn old_protocol_client_is_told_to_upgrade() {
-    use hbt_proto::{read_msg, write_msg, ClientMsg, Hello, ServerMsg};
-    let fx = Fixture::start("40000-40000", &[]);
-    let mut s = None;
-    for _ in 0..50 {
-        if let Ok(c) = TcpStream::connect(fx.addr()).await {
-            s = Some(c);
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    let mut s = s.expect("servidor não subiu");
-    // Exatamente o que o cliente do protocolo 1 manda.
-    write_msg(
-        &mut s,
-        &Hello::V1Control {
-            token_id: "abc".into(),
-        },
-    )
-    .await
-    .unwrap();
-    let ServerMsg::Challenge(_) = read_msg(&mut s).await.unwrap() else {
-        panic!("esperava Challenge");
-    };
-    write_msg(&mut s, &ClientMsg::Auth(vec![0; 32])).await.unwrap();
-    match read_msg(&mut s).await.unwrap() {
-        ServerMsg::Error(e) => assert!(e.contains("atualize"), "{e}"),
-        other => panic!("esperava Error, veio {other:?}"),
     }
 }
 

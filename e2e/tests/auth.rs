@@ -140,3 +140,39 @@ async fn token_cli_create_list_revoke() {
     let list = String::from_utf8(fx.token_cmd(&["list"]).stdout).unwrap();
     assert!(list.contains("nenhum token"));
 }
+
+#[tokio::test]
+async fn wrong_fingerprint_is_refused_with_a_clear_message() {
+    let public = free_port();
+    let fx = Fixture::start(&format!("{public}-{public}"), &[]);
+    let token = fx.token("t", &[]);
+    let mut c = cmd("hbt");
+    c.args([
+        "--server",
+        &fx.addr(),
+        "--fingerprint",
+        &"00".repeat(32),
+        "tcp",
+        "1",
+    ])
+    .env("HBT_TOKEN", &token)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let mut client = c.spawn().unwrap();
+    // Os avisos (tracing) do cliente saem no stdout.
+    let mut out = tokio::io::BufReader::new(client.stdout.take().unwrap());
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(15),
+        tokio::io::AsyncBufReadExt::read_line(&mut out, &mut line),
+    )
+    .await
+    .expect("cliente deveria avisar do handshake")
+    .unwrap();
+    assert!(
+        line.contains("fingerprint"),
+        "mensagem sem pista do fingerprint: {line}"
+    );
+    // Sem túnel registrado: o servidor não deve ter aberto a porta pública.
+    assert!(TcpStream::connect(("127.0.0.1", public)).await.is_err());
+}

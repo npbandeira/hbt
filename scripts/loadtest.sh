@@ -43,7 +43,8 @@ docker inspect -f '    limites: NanoCpus={{.HostConfig.NanoCpus}} Memory={{.Host
 
 say "token e clientes"
 HBT_TOKEN="$(dc exec -T server hbt-server token create "load-$RANDOM" --quiet)"
-export HBT_TOKEN
+HBT_FINGERPRINT="$(dc exec -T server hbt-server fingerprint)"
+export HBT_TOKEN HBT_FINGERPRINT
 dc --profile clients up -d client-http client-tcp client-udp
 
 # O gerador também abre muitas conexões curtas: sem isso ele mesmo esgota portas (os error 99).

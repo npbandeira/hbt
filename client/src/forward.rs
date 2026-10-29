@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use hbt_proto::mux::MuxStream;
+use hbt_proto::mux::{recv_udp, send_udp, MuxStream};
 use hbt_proto::*;
-use tokio::io::{copy_bidirectional, BufReader};
+use quinn::{Connection, SendDatagramError};
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -37,28 +37,16 @@ type Sessions = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>;
 
 /// Túnel UDP. Cada "peer" público ganha um socket UDP local próprio, para o
 /// serviço local enxergar origens distintas e as respostas voltarem ao peer certo.
-pub async fn udp_data(stream: MuxStream, local: &str) -> Result<()> {
+/// Os datagramas chegam e saem como datagramas QUIC (sem ordem nem retransmissão).
+pub async fn udp_data(conn: Connection, local: &str) -> Result<()> {
     let local_addr = tokio::net::lookup_host(local)
         .await?
         .next()
         .with_context(|| format!("não resolvi {local}"))?;
 
-    let (rd, mut wr) = tokio::io::split(stream);
-    let mut rd = BufReader::new(rd);
-
-    // Respostas do serviço local -> canal -> UM task escritor no stream.
-    let (out_tx, mut out_rx) = mpsc::channel::<UdpFrame>(256);
-    let _writer = AbortOnDrop(tokio::spawn(async move {
-        while let Some(f) = out_rx.recv().await {
-            if write_msg(&mut wr, &f).await.is_err() {
-                return;
-            }
-        }
-    }));
-
     let sessions: Sessions = Arc::default();
     loop {
-        let frame: UdpFrame = read_msg(&mut rd).await?;
+        let frame = recv_udp(&conn).await?;
 
         let existing = sessions.lock().unwrap().get(&frame.peer).cloned();
         let sock = match existing {
@@ -77,7 +65,7 @@ pub async fn udp_data(stream: MuxStream, local: &str) -> Result<()> {
                 tokio::spawn(local_to_peer(
                     s.clone(),
                     frame.peer,
-                    out_tx.clone(),
+                    conn.clone(),
                     sessions.clone(),
                 ));
                 s
@@ -90,12 +78,7 @@ pub async fn udp_data(stream: MuxStream, local: &str) -> Result<()> {
     }
 }
 
-async fn local_to_peer(
-    sock: Arc<UdpSocket>,
-    peer: SocketAddr,
-    out: mpsc::Sender<UdpFrame>,
-    sessions: Sessions,
-) {
+async fn local_to_peer(sock: Arc<UdpSocket>, peer: SocketAddr, conn: Connection, sessions: Sessions) {
     let mut buf = vec![0u8; 65535];
     // `while let` com padrão que só casa em sucesso: erro de I/O ou ociosidade
     // (Elapsed) encerram o loop e liberam o socket.
@@ -104,8 +87,11 @@ async fn local_to_peer(
             peer,
             data: buf[..n].to_vec(),
         };
-        if out.send(frame).await.is_err() {
-            break;
+        match send_udp(&conn, &frame) {
+            Ok(()) => {}
+            Err(SendDatagramError::ConnectionLost(_)) => break,
+            // Maior que o MTU do caminho: descartado, como um roteador faria.
+            Err(e) => debug!("resposta a {peer} ({n}B) descartada: {e}"),
         }
     }
     sessions.lock().unwrap().remove(&peer);

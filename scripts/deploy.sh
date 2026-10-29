@@ -44,8 +44,9 @@ if [[ $CONFIGURE -eq 1 ]]; then
   NAME="$(whoami)@$(hostname -s)-$(date +%Y%m%d%H%M%S)"
   TOKEN="$("${SSH[@]}" "sudo -u hbt /usr/local/bin/hbt-server token create '$NAME' --quiet")"
   [[ -n "$TOKEN" ]] || { echo "não consegui criar o token no servidor" >&2; exit 1; }
+  FINGERPRINT="$("${SSH[@]}" "sudo -u hbt /usr/local/bin/hbt-server fingerprint")"
   [[ -x "$HOME/.local/bin/hbt" ]] || ./scripts/install-client.sh
-  HBT_SERVER="$PUBLIC_HOST" HBT_TOKEN="$TOKEN" "$HOME/.local/bin/hbt" configure
+  HBT_SERVER="$PUBLIC_HOST" HBT_TOKEN="$TOKEN" HBT_FINGERPRINT="$FINGERPRINT" "$HOME/.local/bin/hbt" configure
   echo
   echo "Token '$NAME' criado. Para revogar:  ssh $TARGET sudo -u hbt hbt-server token revoke '$NAME'"
   echo "Pronto. Teste:  hbt http 3000"

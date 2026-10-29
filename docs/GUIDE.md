@@ -16,25 +16,28 @@ Workspace Cargo com 5 crates:
 `target/`. Evita compilar dependências duas vezes e permite que cliente e
 servidor usem o *mesmo* crate de protocolo.
 
-### Uma conexão TCP por túnel, iniciada pelo cliente
+### Uma conexão QUIC por túnel, iniciada pelo cliente
 
-1. **Handshake**: o cliente conecta na porta de controle, manda `Hello`,
-   responde ao desafio HMAC e registra o túnel (`Register` → `Registered`).
-2. **Sessão multiplexada**: a partir daí a MESMA conexão vira uma sessão
-   [yamux](https://github.com/hashicorp/yamux/blob/master/spec.md)
-   (`proto/src/mux.rs`). O servidor abre *streams* lógicos dentro dela; cada
-   stream começa com um byte de tipo:
-   - **controle** (um por sessão): heartbeats nos dois sentidos;
-   - **conexão** (um por usuário público, TCP ou HTTP): bytes crus;
-   - **UDP** (um por túnel): todos os datagramas em `UdpFrame`s.
+1. **Conexão e handshake**: o cliente abre uma conexão QUIC (UDP) na porta de
+   controle; o TLS 1.3 só aceita o certificado cujo SHA-256 é o `--fingerprint`
+   configurado (`proto/src/quic.rs`). No primeiro stream bidirecional ele manda
+   `Hello`, responde ao desafio HMAC e registra o túnel (`Register` →
+   `Registered`). Esse stream segue como **stream de controle**: heartbeats nos
+   dois sentidos.
+2. **Tráfego** (`proto/src/mux.rs`), tudo dentro da mesma conexão:
+   - **TCP/HTTP**: o servidor abre um *stream* por usuário público; começa com
+     um byte de tipo (o QUIC só avisa o par de um stream novo quando chega o
+     primeiro byte) e depois são bytes crus;
+   - **UDP**: cada datagrama público vira um *datagrama QUIC* (RFC 9221) com um
+     `UdpFrame`, sem ordem nem retransmissão.
 
 ```
-usuário ──► [porta pública] ──► servidor abre stream nº N ══ sessão (1 conexão TCP) ══► cliente ──► serviço local
+usuário ──► [porta pública] ──► servidor abre stream nº N ══ conexão QUIC (UDP) ══► cliente ──► serviço local
 ```
 
 Abrir um stream não tem handshake: o servidor já manda os dados junto com o
 cabeçalho do stream. Por isso uma conexão pública nova custa 1 RTT até o
-cliente (a requisição em si), e não ~3 RTT como no protocolo antigo, em que o
+cliente (a requisição em si), e não ~3 RTT como na primeira versão, em que o
 cliente abria uma conexão TCP nova até o servidor para cada usuário.
 
 ### Túneis HTTP (`hbt http 3000`)
@@ -110,41 +113,44 @@ reenviando antes os bytes já lidos. Se não houver rota: 404; sessão caída:
 
 ## 4. Trade-offs das decisões
 
-**Multiplexação (yamux) vs. uma conexão por usuário**
+**Multiplexação (QUIC) vs. uma conexão por usuário**
 A primeira versão abria uma conexão TCP nova do cliente até o servidor para
 cada usuário público. Medido com ping de 63 ms até o VPS: uma requisição com
 conexão nova levava ~200 ms (~3 RTT); com keep-alive, ~70 ms. Sob ~60
 conexões novas por segundo, a rede do cliente (NAT/roteador) passou a perder
 pacotes e apareceram 504s. Com muitas conexões curtas, o cliente também
-esgotava as portas efêmeras (TIME_WAIT). Hoje tudo passa por uma conexão só,
-como frp/rathole: nada disso existe. Custo: um pacote perdido nessa conexão
-atrasa todos os usuários do túnel até a retransmissão (HOL blocking), e todo o
-tráfego passa por um task só por sessão. Num servidor com 1 CPU isso não
-reduziu a vazão de forma relevante depois de bufferizar o socket (o yamux
-escreve cabeçalho e corpo de cada frame em chamadas separadas).
-Alternativa sem HOL blocking: QUIC (`quinn`), que multiplexa sobre UDP.
+esgotava as portas efêmeras (TIME_WAIT). Depois tudo passou por uma conexão TCP
+só com yamux, como frp/rathole, mas um pacote perdido atrasava todos os
+usuários do túnel até a retransmissão (HOL blocking) e o UDP herdava isso.
+Hoje a conexão é QUIC (`quinn`): os streams são independentes (a perda num não
+atrasa os outros) e o UDP usa datagramas não confiáveis.
 
-**Limite de streams por sessão**
-O yamux derruba a sessão INTEIRA se o número de streams passar do limite
-configurado, e só "esquece" um stream fechado um pouco depois. Por isso o
-limite dele é 2048 e o nosso, controlado por um semáforo, é 1024 conexões
-simultâneas por túnel: acima disso, conexões novas esperam vaga (até 10s,
-depois 504) em vez de derrubar o túnel.
+**Limite de streams por conexão**
+`max_concurrent_bidi_streams` (1024, em `quic.rs`) é o teto de conexões
+simultâneas por túnel: acima disso, `open_bi` espera vaga (até 10s, depois 504)
+em vez de derrubar o túnel. Janelas de stream e de envio são folgadas (8 e 16
+MiB) para não limitar a vazão em links de alta latência.
 
-**Compatibilidade entre versões**
-O bincode identifica variantes de enum pela posição, então as mensagens do
-protocolo antigo continuam declaradas (`V1Control`, `V1NewConn`...) só para
-não deslocar as outras. Um cliente antigo recebe "atualize o hbt" e para,
-em vez de tentar reconectar para sempre; um cliente novo num servidor antigo
-avisa que o servidor parece antigo.
+**Sem compatibilidade com o transporte antigo**
+A troca TCP+yamux → QUIC não é compatível: cliente e servidor precisam estar na
+mesma versão, e a porta de controle passou de TCP para UDP (libere `7000/udp`).
+Não há fallback para TCP: clientes atrás de firewall que bloqueia UDP de saída
+não conectam.
 
-**UDP dentro de TCP**
-Nossa escolha: datagramas viajam num stream TCP com framing. Simples e
-atravessa qualquer firewall. Custo: TCP garante ordem e retransmite, o que
-anula o ponto do UDP (latência baixa tolerando perda): sob perda de pacotes
-você tem HOL blocking e picos de latência. Ruim para jogos/voz sob rede ruim;
-OK para DNS, WireGuard, syslog. Alternativa melhor: QUIC datagrams (crate
-`quinn`), ou UDP direto cliente↔servidor com hole punching (mais complexo).
+**Identidade do servidor: certificado autoassinado + fingerprint**
+Não há CA nem domínio: o servidor gera o certificado na primeira execução
+(`cert.der`/`key.der` em `--data-dir`) e o cliente só aceita o certificado com o
+SHA-256 configurado (`hbt configure --fingerprint`). É *pinning*: quem não
+conhece o fingerprint não consegue se passar pelo servidor. Custo: trocar o
+certificado exige reconfigurar os clientes.
+
+**UDP em datagramas QUIC**
+Cada datagrama público vira um datagrama QUIC com um `UdpFrame` (peer + dados):
+sem ordem, sem retransmissão, sem head-of-line blocking. Custo: o datagrama
+precisa caber no MTU do caminho (~1200–1400 bytes menos ~20–30 de cabeçalho do
+`UdpFrame`); maiores são descartados, como um roteador faria (WireGuard: use
+`MTU = 1280`). Melhoria futura: framing binário compacto (`[família][ip][porta]
+[dados]`) no lugar de bincode.
 
 **Sessões UDP e timeout de 60s**
 UDP não tem conexão; "sessão" = peer público. Cada peer ganha um socket local
@@ -160,20 +166,18 @@ limites opcionais (portas/subdomínios), e pode ser revogado sozinho: o servidor
 relê o arquivo a cada autenticação e a cada heartbeat, então a revogação derruba
 sessões ativas em até ~10s. Um id desconhecido recebe o desafio como qualquer
 outro e falha com a mesma mensagem (evita descobrir quais ids existem).
-*Limite honesto:* sem TLS, quem copia `tokens.json` tem as chaves e consegue
-responder ao desafio ("pass-the-hash"): guardar a chave derivada só protege de
-verdade quando o canal for TLS e o servidor guardar um hash dela. O formato
-já está pronto para essa migração. Armazenamento em JSON atende dezenas de
+*Limite honesto:* quem copia `tokens.json` tem as chaves e consegue responder
+ao desafio ("pass-the-hash"): o servidor ainda guarda a chave derivada, não um
+hash dela. Agora que o canal é TLS, essa migração é possível; o formato já está
+pronto. Armazenamento em JSON atende dezenas de
 clientes; para muitos milhares, use SQLite.
 
-**Autenticação HMAC sem criptografia**
-Prova que o cliente conhece o segredo e impede replay, mas o tráfego
-trafega em claro entre cliente e servidor, e um atacante no meio da rede
-poderia sequestrar a conexão depois do handshake. Para a internet pública,
-envolva em TLS (`tokio-rustls`) ou rode o túnel dentro de WireGuard/SSH. Se o
-serviço exposto já usa TLS/SSH (HTTPS, ssh), o payload já é protegido.
-Escolhemos HMAC primeiro para manter o foco no assunto "túnel"; TLS é o
-próximo passo natural.
+**Autenticação HMAC dentro de TLS**
+O HMAC prova que o cliente conhece o segredo e impede replay; o canal QUIC/TLS
+1.3 (com o fingerprint conferido) criptografa o tráfego entre cliente e
+servidor e impede o homem-no-meio. O trecho público (usuário → porta pública)
+continua em claro, como qualquer porta TCP/UDP: se o serviço exposto não usa
+TLS/SSH, o payload não é protegido nesse lado.
 
 **bincode vs JSON**
 bincode é compacto e rápido, mas ilegível e sem versionamento. JSON é

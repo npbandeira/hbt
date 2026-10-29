@@ -1,13 +1,13 @@
-//! Sessão com o servidor: handshake, reconexão, heartbeat e despacho de streams.
+//! Sessão com o servidor: conexão QUIC, handshake, reconexão, heartbeat e despacho de streams.
 
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use hbt_proto::mux::{self, Mode, MuxStream, StreamKind};
+use hbt_proto::mux::{MuxStream, StreamKind};
 use hbt_proto::*;
+use quinn::{Connection, Endpoint};
 use tokio::io::BufReader;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::lookup_host;
 use tokio::time::{interval, timeout};
 use tracing::{debug, error, warn};
 
@@ -66,10 +66,46 @@ pub async fn reconnect_loop(conn: &Conn, plan: &Plan) -> Result<()> {
     }
 }
 
+/// Abre a conexão QUIC, roda a sessão e fecha a conexão ao final (em
+/// qualquer caminho de saída), para o servidor perceber na hora.
 async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<()> {
-    let mut ctl = TcpStream::connect(&conn.server)
+    let addr = lookup_host(&conn.server)
         .await
-        .with_context(|| format!("conectando em {}", conn.server))?;
+        .ok()
+        .and_then(|mut a| a.next())
+        .with_context(|| format!("não resolvi {}", conn.server))?;
+    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let endpoint = Endpoint::client(bind.parse()?)?;
+    let cfg = quic::client_config(&conn.fingerprint)?;
+    let quic_conn = timeout(
+        Duration::from_secs(10),
+        endpoint.connect_with(cfg, addr, quic::SERVER_NAME)?,
+    )
+    .await
+    .context("timeout conectando (a porta de controle é UDP: o firewall libera?)")?
+    .with_context(|| {
+        format!(
+            "conectando em {} (confira o servidor, a porta UDP e o fingerprint)",
+            conn.server
+        )
+    })?;
+
+    let result = serve_session(&quic_conn, conn, plan, registered).await;
+    quic_conn.close(0u32.into(), b"bye");
+    // Dá tempo de o CONNECTION_CLOSE sair antes de largar o socket.
+    let _ = timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
+    result
+}
+
+async fn serve_session(
+    quic_conn: &Connection,
+    conn: &Conn,
+    plan: &Plan,
+    registered: &mut bool,
+) -> Result<()> {
+    // O primeiro stream faz o handshake e depois segue como stream de controle.
+    let (send, recv) = quic_conn.open_bi().await?;
+    let mut ctl = MuxStream::new(send, recv);
     write_msg(
         &mut ctl,
         &Hello::Control {
@@ -80,9 +116,7 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
 
     let msg: ServerMsg = timeout(Duration::from_secs(5), read_msg(&mut ctl))
         .await
-        .context("timeout")?
-        // Um hbt-server antigo não entende o Hello novo e só fecha a conexão.
-        .context("o servidor fechou a conexão no handshake (hbt-server antigo, sem multiplexação?)")?;
+        .context("timeout")??;
     let ServerMsg::Challenge(nonce) = msg else {
         bail!("esperava Challenge")
     };
@@ -112,32 +146,25 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
         _ => bail!("resposta inesperada ao registro"),
     }
 
-    // Daqui em diante a conexão é uma sessão multiplexada: o servidor abre
-    // os streams e nós só os recebemos (o `Opener` daqui nunca é usado).
-    let (in_tx, mut in_rx) = mpsc::channel::<mux::Stream>(mux::MAX_STREAMS);
-    let (_opener, requests) = mux::opener();
-    let mut session = AbortOnDrop(tokio::spawn(async move {
-        if let Err(e) = mux::run(ctl, Mode::Client, requests, Some(in_tx)).await {
-            debug!("sessão: {e}");
+    // Daqui em diante o servidor abre um stream por usuário público (TCP/HTTP)
+    // ou manda datagramas (UDP); nós só recebemos.
+    let _dispatcher = AbortOnDrop(tokio::spawn({
+        let (quic_conn, local) = (quic_conn.clone(), plan.local.clone());
+        async move {
+            while let Ok((send, recv)) = quic_conn.accept_bi().await {
+                tokio::spawn(dispatch(send, recv, local.clone()));
+            }
         }
     }));
+    let _udp = matches!(plan.spec, TunnelSpec::Udp { .. }).then(|| {
+        let (quic_conn, local) = (quic_conn.clone(), plan.local.clone());
+        AbortOnDrop(tokio::spawn(async move {
+            if let Err(e) = udp_data(quic_conn, &local).await {
+                debug!("túnel UDP: {e:#}");
+            }
+        }))
+    });
 
-    // Cada stream recebido ganha um task; o de controle volta para cá.
-    let (ctl_tx, mut ctl_rx) = mpsc::channel::<MuxStream>(1);
-    let local = plan.local.clone();
-    let _dispatcher = AbortOnDrop(tokio::spawn(async move {
-        while let Some(raw) = in_rx.recv().await {
-            tokio::spawn(dispatch(raw, local.clone(), ctl_tx.clone()));
-        }
-    }));
-
-    // O servidor abre o stream de controle logo depois de `Registered`.
-    let ctl = tokio::select! {
-        c = timeout(Duration::from_secs(5), ctl_rx.recv()) => c
-            .context("timeout esperando o stream de controle")?
-            .context("sessão encerrada")?,
-        _ = &mut session.0 => bail!("conexão com o servidor caiu"),
-    };
     let (rd, mut wr) = tokio::io::split(ctl);
     let mut rd = BufReader::new(rd);
 
@@ -155,8 +182,8 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
         }
     }));
 
-    // Se a sessão cair, a leitura do stream de controle falha e saímos daqui;
-    // ao sair, os guards derrubam a sessão e todos os streams junto.
+    // Se a conexão cair, a leitura do stream de controle falha e saímos daqui;
+    // ao sair, os guards derrubam os tasks e o chamador fecha a conexão.
     loop {
         // Se o timeout estourar, `?` sai da função: a sessão é descartada
         // inteira, então perder bytes de uma leitura cancelada não importa.
@@ -171,24 +198,16 @@ async fn run_session(conn: &Conn, plan: &Plan, registered: &mut bool) -> Result<
     }
 }
 
-/// Um stream aberto pelo servidor: o primeiro byte diz o que ele carrega.
-async fn dispatch(raw: mux::Stream, local: String, ctl: mpsc::Sender<MuxStream>) {
-    let (kind, stream) = match MuxStream::accept(raw).await {
+/// Um stream aberto pelo servidor para um usuário público.
+async fn dispatch(send: quinn::SendStream, recv: quinn::RecvStream, local: String) {
+    let (kind, stream) = match MuxStream::accept(send, recv).await {
         Ok(x) => x,
         Err(e) => return debug!("stream inválido: {e}"),
     };
     match kind {
-        StreamKind::Control => {
-            let _ = ctl.send(stream).await;
-        }
         StreamKind::Conn => {
             if let Err(e) = tcp_conn(stream, &local).await {
                 warn!("conexão TCP: {e:#}");
-            }
-        }
-        StreamKind::Udp => {
-            if let Err(e) = udp_data(stream, &local).await {
-                debug!("stream UDP: {e:#}");
             }
         }
     }

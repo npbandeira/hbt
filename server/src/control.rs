@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use hbt_proto::mux::{self, Opener};
+use hbt_proto::mux::{MuxStream, Opener};
 use hbt_proto::*;
 use rand::Rng;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 use tracing::info;
 
@@ -19,45 +20,46 @@ use crate::state::{RouteGuard, State};
 use crate::tokens::TokenRecord;
 use crate::tunnel::run_tunnel;
 
-const OLD_CLIENT: &str = "este cliente hbt é antigo (uma conexão por usuário); \
-     atualize o hbt para a versão com multiplexação";
+/// Entrega `msg` ao cliente antes de largar a conexão: largar a `Connection`
+/// a fecha na hora e a mensagem se perderia (no TCP o close entregava).
+async fn reject(stream: &mut MuxStream, conn: &quinn::Connection, msg: String) {
+    let _ = write_msg(stream, &ServerMsg::Error(msg)).await;
+    let _ = stream.shutdown().await;
+    // O cliente fecha a conexão assim que lê o erro.
+    let _ = timeout(Duration::from_secs(2), conn.closed()).await;
+}
 
 /// Uma conexão na porta de controle: handshake e, se der certo, o túnel.
-pub async fn handle_conn(mut stream: TcpStream, state: Arc<State>) -> Result<()> {
+pub async fn handle_conn(incoming: quinn::Incoming, state: Arc<State>) -> Result<()> {
+    let conn = timeout(Duration::from_secs(5), incoming)
+        .await
+        .context("timeout no handshake QUIC")??;
+    // O primeiro stream do cliente faz o handshake e depois vira o de controle.
+    let (send, recv) = timeout(Duration::from_secs(5), conn.accept_bi())
+        .await
+        .context("timeout esperando o stream de controle")??;
+    let mut stream = MuxStream::new(send, recv);
     let hello: Hello = timeout(Duration::from_secs(5), read_msg(&mut stream))
         .await
         .context("timeout esperando Hello")??;
-    match hello {
-        // O cliente antigo só mostra (e desiste com) um `Error` recebido
-        // DEPOIS do desafio; antes disso ele só tentaria de novo para sempre.
-        Hello::V1Control { .. } => {
+    let Hello::Control { token_id } = hello;
+    // Qualquer erro antes de "Registered" é reportado ao cliente.
+    let opener = Opener::new(conn.clone());
+    match timeout(
+        Duration::from_secs(5),
+        negotiate(&mut stream, &state, &opener, &token_id),
+    )
+    .await
+    {
+        Ok(Ok((bound, rec))) => run_tunnel(stream, conn, state, bound, rec, opener).await,
+        Ok(Err(e)) => {
             state.metrics.handshake_failed();
-            write_msg(&mut stream, &ServerMsg::Challenge(rand::random())).await?;
-            let _ = timeout(Duration::from_secs(5), read_msg::<_, ClientMsg>(&mut stream)).await;
-            let _ = write_msg(&mut stream, &ServerMsg::Error(OLD_CLIENT.into())).await;
-            bail!("cliente com protocolo antigo recusado")
+            reject(&mut stream, &conn, e.to_string()).await;
+            Err(e)
         }
-        Hello::V1Accept(_) => bail!("conexão de dados do protocolo antigo"),
-        Hello::Control { token_id } => {
-            // Qualquer erro antes de "Registered" é reportado ao cliente.
-            let (opener, requests) = mux::opener();
-            match timeout(
-                Duration::from_secs(5),
-                negotiate(&mut stream, &state, &opener, &token_id),
-            )
-            .await
-            {
-                Ok(Ok((bound, rec))) => run_tunnel(stream, state, bound, rec, opener, requests).await,
-                Ok(Err(e)) => {
-                    state.metrics.handshake_failed();
-                    let _ = write_msg(&mut stream, &ServerMsg::Error(e.to_string())).await;
-                    Err(e)
-                }
-                Err(_) => {
-                    state.metrics.handshake_failed();
-                    bail!("timeout no handshake")
-                }
-            }
+        Err(_) => {
+            state.metrics.handshake_failed();
+            bail!("timeout no handshake")
         }
     }
 }
@@ -72,7 +74,7 @@ pub enum Bound {
 
 /// Autentica o cliente e abre a porta pública pedida.
 async fn negotiate(
-    stream: &mut TcpStream,
+    stream: &mut MuxStream,
     state: &Arc<State>,
     opener: &Opener,
     token_id: &str,

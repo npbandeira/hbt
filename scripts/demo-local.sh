@@ -37,6 +37,7 @@ CONTROL=$(free_port); HTTP=$(free_port); SITE=$(free_port); LO=$(free_port); HI=
 export XDG_CONFIG_HOME="$W/config"          # o ~/.config real não é tocado
 export HBT_DATA_DIR="$W/data"
 unset HBT_TOKEN HBT_SERVER HBT_DOMAIN
+export HBT_FINGERPRINT="$("$SERVER" fingerprint)"   # o cliente só confia neste certificado
 
 say "servidor (controle :$CONTROL, HTTP :$HTTP, domínio *.localhost, portas $LO-$HI)"
 "$SERVER" serve --control-bind "127.0.0.1:$CONTROL" --tunnel-ip 127.0.0.1 \
@@ -54,9 +55,9 @@ ADMIN=$("$SERVER" token create admin --quiet)
 "$SERVER" token list
 echo "    (o segredo não aparece na listagem nem no disco)"
 
-# Aguarda o servidor aceitar conexões.
+# Aguarda o servidor abrir a porta de controle (UDP: não dá para testar com connect).
 for _ in $(seq 50); do
-  python3 -c "import socket; socket.create_connection(('127.0.0.1',$CONTROL),0.2)" 2>/dev/null && break
+  grep -q "controle em" "$W/server.log" 2>/dev/null && break
   sleep 0.1
 done
 

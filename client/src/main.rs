@@ -1,15 +1,15 @@
 //! hbt: CLI do cliente. Roda na máquina que tem o serviço local e expõe
 //! esse serviço através de uma porta pública do `hbt-server`.
 //!
-//!   hbt configure --server meu.vps --token ID.SEGREDO    (uma vez só)
+//!   hbt configure --server meu.vps --token ID.SEGREDO --fingerprint FP   (uma vez só)
 //!   hbt http 3000          # URL pública para o site local na porta 3000
 //!   hbt tcp 22             # porta pública (sorteada) para o ssh local
 //!   hbt udp 51820          # idem para UDP
 //!
 //! "Reverse" tunnel: quem inicia a conexão é o cliente (saída), então funciona
-//! atrás de NAT/firewall sem abrir nenhuma porta de entrada. É UMA conexão só:
-//! depois do handshake ela vira uma sessão multiplexada e cada usuário público
-//! chega como um stream dentro dela (veja proto/src/mux.rs).
+//! atrás de NAT/firewall sem abrir nenhuma porta de entrada. É UMA conexão QUIC
+//! só: cada usuário público TCP/HTTP chega como um stream dentro dela e cada
+//! datagrama UDP como um datagrama QUIC (veja proto/src/mux.rs).
 
 mod cli;
 mod config;

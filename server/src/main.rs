@@ -6,17 +6,19 @@
 //!
 //! Fluxo (resumo; detalhes em docs/GUIDE.md):
 //!
-//!   cliente conecta na porta de controle, autentica e registra o túnel;
-//!   a partir daí essa MESMA conexão vira uma sessão multiplexada (yamux).
+//!   cliente abre uma conexão QUIC na porta de controle (UDP), autentica e
+//!   registra o túnel no primeiro stream; a mesma conexão carrega todo o tráfego.
 //!
 //!   usuário --> [porta pública no servidor]
-//!                   |  servidor abre um stream novo na sessão (sem handshake)
+//!                   |  servidor abre um stream QUIC novo (TCP/HTTP) ou manda um
+//!                   |  datagrama QUIC (UDP), sem handshake
 //!                   v
 //!               cliente recebe o stream, conecta no serviço local e cola as pontas
 
 mod cli;
 mod control;
 mod http_edge;
+mod identity;
 mod metrics;
 mod serve;
 mod state;
@@ -40,7 +42,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = TokenStore::new(&cli.data_dir);
     match cli.cmd {
-        Command::Token { cmd } => cli::token_admin(&store, cmd),
-        Command::Serve(args) => serve::serve(args, store).await,
+        Command::Token { cmd } => cli::token_admin(&store, cmd, &cli.data_dir),
+        Command::Fingerprint => {
+            println!("{}", identity::load_or_create(&cli.data_dir)?.fingerprint());
+            Ok(())
+        }
+        Command::Serve(args) => serve::serve(args, store, identity::load_or_create(&cli.data_dir)?).await,
     }
 }

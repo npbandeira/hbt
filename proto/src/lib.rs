@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 pub mod error;
 pub mod mux;
+pub mod quic;
 
 pub use error::ProtoError;
 
@@ -56,28 +57,15 @@ pub enum TunnelSpec {
     },
 }
 
-/// Primeira mensagem de TODA conexão que chega na porta de controle.
-/// Um `enum` em Rust é uma "union tagged": o valor é exatamente UMA variante,
-/// e o `match` obriga a tratar todas.
-///
-/// O bincode identifica a variante pela POSIÇÃO. Por isso as variantes do
-/// protocolo antigo continuam aqui, no mesmo lugar: um cliente antigo ainda
-/// é entendido o suficiente para receber "atualize o hbt" em vez de lixo.
+/// Primeira mensagem do cliente, no stream de handshake da conexão QUIC.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Hello {
-    /// Protocolo 1 (uma conexão TCP nova por usuário). Só é recusado.
-    V1Control {
-        /// Id do token.
-        token_id: String,
-    },
-    /// Protocolo 1: conexão de dados. Só é recusado.
-    V1Accept(u128),
     /// "Sou o cliente cujo token tem este id; abrindo um túnel": segue o
     /// desafio HMAC. O id NÃO é secreto (é só o "nome de usuário"); serve
     /// para o servidor achar qual chave usar na verificação.
     ///
-    /// Depois de `Registered`, a conexão vira uma sessão multiplexada
-    /// (veja [`mux`]).
+    /// Depois de `Registered`, o mesmo stream segue como stream de controle
+    /// (heartbeats) e o resto do tráfego usa a conexão (veja [`mux`]).
     Control {
         /// Id do token (não secreto).
         token_id: String,
@@ -107,11 +95,6 @@ pub enum ServerMsg {
         /// Endereço público atribuído ao túnel.
         public: Public,
     },
-    /// Protocolo 1; não é mais enviado. Fica para não mudar a posição das
-    /// variantes seguintes (o cliente antigo precisa decodificar `Error`).
-    V1NewConn(u128),
-    /// Protocolo 1; idem.
-    V1NewUdpStream(u128),
     /// Sinal de vida periódico.
     Heartbeat,
     /// Erro fatal reportado ao cliente, em texto legível.
@@ -129,7 +112,7 @@ pub enum ClientMsg {
     Heartbeat,
 }
 
-/// Um datagrama UDP viajando dentro do stream UDP do túnel.
+/// Um datagrama UDP viajando dentro de um datagrama QUIC do túnel.
 /// `peer` = quem mandou (lado público); precisamos dele para responder à
 /// pessoa certa, já que UDP não tem "conexão".
 #[derive(Debug, Serialize, Deserialize)]
@@ -215,11 +198,11 @@ pub fn parse_token(token: &str) -> Option<(&str, &str)> {
 /// Chave de autenticação derivada do segredo: SHA-256("hbt-token-v1:" + segredo).
 ///
 /// O servidor guarda ESTA chave (nunca o segredo cru) e o cliente a recalcula
-/// a partir do token. Honestamente: sem TLS isso NÃO protege contra o vazamento
-/// do arquivo do servidor, porque quem tem a chave consegue responder ao
-/// desafio ("pass-the-hash"). O ganho real vem quando o canal for TLS e o
-/// servidor guardar só um hash da chave (próxima etapa). Já deixamos o formato
-/// pronto para essa migração e o token em si nunca fica gravado no servidor.
+/// a partir do token. Honestamente: isso NÃO protege contra o vazamento do
+/// arquivo do servidor, porque quem tem a chave consegue responder ao desafio
+/// ("pass-the-hash"). O canal já é TLS (veja [`quic`]); falta o servidor guardar
+/// só um hash da chave (próxima etapa). O token em si nunca fica gravado no
+/// servidor.
 pub fn derive_key(secret: &str) -> [u8; 32] {
     Sha256::digest(format!("hbt-token-v1:{secret}")).into()
 }
@@ -246,7 +229,7 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// manda um nonce (número aleatório de uso único) e o cliente prova que
 /// conhece a chave assinando-o. Um espião que capture a resposta não pode
 /// reusá-la (o próximo nonce será outro = "replay protection").
-/// Limitação: autentica, mas NÃO criptografa o tráfego (veja docs/GUIDE.md).
+/// Autentica; quem criptografa o tráfego é o canal QUIC/TLS (veja docs/GUIDE.md).
 pub fn auth_response(key: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC aceita qualquer tamanho de chave");
     mac.update(nonce);
@@ -337,5 +320,11 @@ mod tests {
         assert_eq!(hex_decode(&hex_encode(&bytes)), Some(bytes.to_vec()));
         assert_eq!(hex_decode("abc"), None);
         assert_eq!(hex_decode("zz"), None);
+    }
+
+    #[test]
+    fn hex_decode_rejects_non_ascii_without_panicking() {
+        // "é" tem 2 bytes: fatiar no meio do caractere causaria panic.
+        assert_eq!(hex_decode("é"), None);
     }
 }

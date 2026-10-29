@@ -12,7 +12,7 @@ de um servidor na nuvem. Quem inicia todas as conexões é o **cliente**.
 ```sh
 # cliente (Linux/macOS) em ~/.local/bin
 curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh
-hbt configure --server SEU.VPS --token ID.SEGREDO
+hbt configure --server SEU.VPS --token ID.SEGREDO --fingerprint FP
 
 # servidor (Linux + systemd, no VPS)
 curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh -s -- --server --domain tunnel.exemplo.com
@@ -56,7 +56,7 @@ export HBT_DOMAIN=tunnel.exemplo.com           # domínio base dos túneis HTTP
 hbt-server serve                               # controle :7000, HTTP :80, portas 20000-30000
 ```
 
-Libere no firewall `7000/tcp`, `80/tcp` e `20000-30000` (tcp+udp), e crie o
+Libere no firewall `7000/udp` (o controle é QUIC), `80/tcp` e `20000-30000` (tcp+udp), e crie o
 DNS wildcard `*.tunnel.exemplo.com -> IP do servidor` (só para túneis HTTP).
 
 **Tokens: um por cliente**, como no ngrok (o segredo é mostrado uma única vez):
@@ -66,15 +66,23 @@ hbt-server token create ana                          # sem restrições
 hbt-server token create ana --subdomains ana,ana-dev --ports 20000-20010
 hbt-server token list                                # sem segredos
 hbt-server token revoke ana                          # vale na hora: derruba a sessão em ~10s
+hbt-server fingerprint                               # identidade (certificado) do servidor
 ```
 
 `--ports` e `--subdomains` limitam o que aquele token pode abrir. Os tokens
 ficam em `--data-dir` (`HBT_DATA_DIR`, padrão `/var/lib/hbt`).
 
+**Fingerprint:** na primeira execução o servidor gera um certificado
+autoassinado em `--data-dir` (`cert.der`/`key.der`). O cliente só conecta se o
+SHA-256 desse certificado for o `--fingerprint` configurado: é isso que impede
+alguém de se passar pelo servidor, e o tráfego vai criptografado (TLS 1.3).
+`hbt-server token create` já imprime o comando `hbt configure` completo. Apagar
+`cert.der`/`key.der` gera outra identidade e exige reconfigurar os clientes.
+
 **2. Na sua máquina, uma vez só:**
 
 ```sh
-hbt configure --server tunnel.exemplo.com --token ID.SEGREDO
+hbt configure --server tunnel.exemplo.com --token ID.SEGREDO --fingerprint FP
 ```
 
 **3. Sempre que quiser expor algo:**
@@ -88,9 +96,9 @@ hbt tcp 22 --remote-port 22022   # escolhe a porta pública
 hbt http 192.168.0.10:8080       # expõe outra máquina da sua rede local
 ```
 
-O cliente guarda servidor e token em `~/.config/hbt/config.toml` (permissão
-0600). Ordem de prioridade: flag (`--server`, `--token`) > variável
-(`HBT_SERVER`, `HBT_TOKEN`) > arquivo. `hbt configure` sem argumentos mostra a
+O cliente guarda servidor, token e fingerprint em `~/.config/hbt/config.toml`
+(permissão 0600). Ordem de prioridade: flag (`--server`, `--token`,
+`--fingerprint`) > variável (`HBT_SERVER`, `HBT_TOKEN`, `HBT_FINGERPRINT`) > arquivo. `hbt configure` sem argumentos mostra a
 configuração atual. Para ver logs: `RUST_LOG=info hbt http 3000`.
 
 **HTTPS**: o servidor fala HTTP puro; ponha Caddy/nginx com certificado
@@ -103,14 +111,21 @@ roda tudo automaticamente. Na mão:
 export HBT_DATA_DIR=/tmp/hbt-dev HBT_DOMAIN=localhost HBT_HTTP_BIND=127.0.0.1:8080
 hbt-server serve --control-bind 127.0.0.1:7000 &
 TOKEN=$(hbt-server token create dev --quiet)
-hbt configure --server 127.0.0.1 --token "$TOKEN"
+hbt configure --server 127.0.0.1 --token "$TOKEN" --fingerprint "$(hbt-server fingerprint)"
 python3 -m http.server 3000 &
 hbt http 3000 --subdomain demo          # abra http://demo.localhost:8080
 ```
 
 Um processo `hbt` = um túnel; rode vários para expor várias portas. Cada túnel
-usa **uma única conexão TCP** até o servidor: todos os usuários públicos passam
-multiplexados dentro dela (yamux), sem handshake extra por conexão.
+usa **uma única conexão QUIC** (UDP) até o servidor: os usuários públicos de
+TCP/HTTP passam multiplexados dentro dela (um stream por usuário, sem handshake
+extra) e cada datagrama UDP viaja como *datagrama QUIC*, sem ordem nem
+retransmissão, como o UDP original. Clientes atrás de um firewall que bloqueia
+UDP de saída não conseguem conectar.
+
+**MTU do UDP:** um datagrama UDP público maior que o MTU do caminho QUIC
+(~1200–1400 bytes menos ~20–30 de cabeçalho do túnel) é descartado. Em
+WireGuard, use `MTU = 1280`.
 
 Cliente e servidor precisam falar a mesma versão do protocolo: ao atualizar o
 `hbt-server`, atualize também os clientes (`hbt` antigo recebe "atualize o hbt").
@@ -119,7 +134,7 @@ Cliente e servidor precisam falar a mesma versão do protocolo: ao atualizar o
 
 | Pasta | Conteúdo |
 |---|---|
-| `proto/` | protocolo (mensagens, framing) e multiplexação yamux, compartilhados |
+| `proto/` | protocolo (mensagens, framing), configuração QUIC/TLS (`quic.rs`) e multiplexação (`mux.rs`), compartilhados |
 | `server/` | `hbt-server`: `cli.rs` (args/tokens), `serve.rs` (listeners), `control.rs` (handshake/registro), `tunnel.rs` (sessão, TCP/UDP), `http_edge.rs` (roteamento por Host), `state.rs`, `tokens.rs`, `metrics.rs` |
 | `client/` | `hbt`: `cli.rs` (args/credenciais), `session.rs` (conexão, reconexão, heartbeat), `forward.rs` (repasse TCP/UDP), `config.rs` |
 | `e2e/` | testes ponta a ponta com os binários reais, por área: `tunnels`, `http`, `auth`, `configure` (helpers em `tests/common/`) |

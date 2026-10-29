@@ -1,4 +1,4 @@
-//! Configuração persistente do cliente (servidor + token), como o
+//! Configuração persistente do cliente (servidor + token + fingerprint), como o
 //! `ngrok config add-authtoken`: você configura uma vez e depois só digita
 //! `hbt http 3000`.
 //!
@@ -20,6 +20,8 @@ const DEFAULT_PORT: u16 = 7000;
 pub struct Config {
     pub server: Option<String>,
     pub token: Option<String>,
+    /// SHA-256 do certificado do servidor (hex): o único certificado aceito.
+    pub fingerprint: Option<String>,
 }
 
 /// `~/.config/hbt/config.toml` no Linux, equivalente nos outros SOs (crate `dirs`).
@@ -73,6 +75,12 @@ pub fn with_default_port(server: &str) -> String {
     }
 }
 
+/// Normaliza e valida o fingerprint: 64 dígitos hex, com ou sem `:`, em qualquer caixa.
+pub fn parse_fingerprint(s: &str) -> Option<String> {
+    let fp = s.trim().replace(':', "").to_ascii_lowercase();
+    (fp.len() == 64 && fp.bytes().all(|b| b.is_ascii_hexdigit())).then_some(fp)
+}
+
 /// Mostra só o começo do token (não vaze segredos no terminal/histórico).
 pub fn mask(token: &str) -> String {
     let head: String = token.chars().take(4).collect();
@@ -82,6 +90,16 @@ pub fn mask(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_is_normalized_and_validated() {
+        let fp = "AB".repeat(32);
+        assert_eq!(parse_fingerprint(&fp), Some("ab".repeat(32)));
+        let colons = ["ab"; 32].join(":");
+        assert_eq!(parse_fingerprint(&colons), Some("ab".repeat(32)));
+        assert_eq!(parse_fingerprint("abc"), None);
+        assert_eq!(parse_fingerprint(&"zz".repeat(32)), None);
+    }
 
     #[test]
     fn default_port_is_added_only_when_missing() {

@@ -7,7 +7,7 @@
 #   --bin PATH          binário do hbt-server (padrão: procura ao lado do script / em ../dist)
 #   --domain D          domínio base dos túneis HTTP (habilita `hbt http`); mantém o anterior se omitido
 #   --http-bind A       onde escutar HTTP        (padrão 0.0.0.0:80)
-#   --control-bind A    porta de controle         (padrão 0.0.0.0:7000)
+#   --control-bind A    porta de controle (UDP)   (padrão 0.0.0.0:7000)
 #   --port-range A-B    portas públicas tcp/udp   (padrão 20000-30000)
 #   --metrics-bind A    métricas Prometheus       (padrão 127.0.0.1:9477; "" desliga)
 #
@@ -138,15 +138,18 @@ else
 fi
 [[ -n "$METRICS_BIND" ]] && echo "  Métricas: http://$METRICS_BIND/metrics  (na sua máquina: ./scripts/observability.sh up <host-ssh>)"
 echo
+echo "Fingerprint do servidor (cada cliente confere este valor; vai no --fingerprint):"
+echo "  $(sudo -u hbt hbt-server fingerprint)"
+echo
 echo "Crie um token para cada cliente (mostrado uma única vez):"
 echo "  sudo -u hbt hbt-server token create meu-notebook"
 echo "  sudo -u hbt hbt-server token list"
 echo "  sudo -u hbt hbt-server token revoke meu-notebook"
 echo
 echo "Libere no firewall do VPS (e no painel do provedor):"
-echo "  ${CPORT}/tcp   ${HPORT}/tcp   ${RANGE/-/:}/tcp   ${RANGE/-/:}/udp"
+echo "  ${CPORT}/udp   ${HPORT}/tcp   ${RANGE/-/:}/tcp   ${RANGE/-/:}/udp"
 if command -v ufw >/dev/null 2>&1; then
-  echo "  ufw allow ${CPORT}/tcp && ufw allow ${HPORT}/tcp && ufw allow ${RANGE/-/:}/tcp && ufw allow ${RANGE/-/:}/udp"
+  echo "  ufw allow ${CPORT}/udp && ufw allow ${HPORT}/tcp && ufw allow ${RANGE/-/:}/tcp && ufw allow ${RANGE/-/:}/udp"
 fi
 echo
 echo "Logs: journalctl -u hbt-server -f"

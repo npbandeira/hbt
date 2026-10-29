@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Instala o cliente `hbt` na sua máquina e (opcionalmente) já configura.
-#   ./scripts/install-client.sh --server tunnel.exemplo.com --token SEGREDO
+#   ./scripts/install-client.sh --server tunnel.exemplo.com --token SEGREDO --fingerprint FP
 #   ./scripts/install-client.sh                 # só instala
 #
 # Instala em ~/.local/bin (sem sudo). Use --system para /usr/local/bin.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SERVER="" TOKEN="" DEST="$HOME/.local/bin"
+SERVER="" TOKEN="" FINGERPRINT="" DEST="$HOME/.local/bin"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server) SERVER="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
+    --fingerprint) FINGERPRINT="$2"; shift 2 ;;
     --system) DEST=/usr/local/bin; shift ;;
     -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
     *) echo "opção desconhecida: $1" >&2; exit 2 ;;
@@ -30,9 +31,9 @@ fi
 echo "hbt instalado em $DEST/hbt"
 case ":$PATH:" in *":$DEST:"*) ;; *) echo "aviso: $DEST não está no seu PATH" ;; esac
 
-if [[ -n "$SERVER" || -n "$TOKEN" ]]; then
+if [[ -n "$SERVER" || -n "$TOKEN" || -n "$FINGERPRINT" ]]; then
   # Passa pelo ambiente? Não: argumentos aparecem em `ps` por instantes; para
   # um segredo, a env evita isso. O `configure` lê a env e grava no arquivo.
-  HBT_SERVER="$SERVER" HBT_TOKEN="$TOKEN" "$DEST/hbt" configure
+  HBT_SERVER="$SERVER" HBT_TOKEN="$TOKEN" HBT_FINGERPRINT="$FINGERPRINT" "$DEST/hbt" configure
 fi
 echo "Uso: hbt http 3000"

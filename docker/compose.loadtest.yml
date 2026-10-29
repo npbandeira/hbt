@@ -32,7 +32,7 @@ services:
     image: hbt:bench
     command: hbt-udpbench echo --bind 0.0.0.0:9000
 
-  # Até o servidor o cliente usa uma conexão só (multiplexada), mas cada
+  # Até o servidor o cliente usa uma conexão QUIC só (multiplexada), mas cada
   # conexão pública ainda vira uma conexão nova até o serviço local (aqui, o
   # nginx), como em qualquer proxy reverso. Com os padrões do Linux, ~28k
   # conexões curtas por minuto esgotam as portas efêmeras (TIME_WAIT); no teste
@@ -40,7 +40,7 @@ services:
   client-http:
     image: hbt:local
     command: hbt http backend:80 --subdomain load
-    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}", HBT_FINGERPRINT: "${HBT_FINGERPRINT:-}" }
     depends_on: [server, backend]
     profiles: [clients]
     sysctls: &client-sysctls
@@ -50,7 +50,7 @@ services:
   client-tcp:
     image: hbt:local
     command: hbt tcp backend:80 --remote-port 20000
-    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}", HBT_FINGERPRINT: "${HBT_FINGERPRINT:-}" }
     depends_on: [server, backend]
     profiles: [clients]
     sysctls: *client-sysctls
@@ -58,6 +58,6 @@ services:
   client-udp:
     image: hbt:local
     command: hbt udp udp-echo:9000 --remote-port 20001
-    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}" }
+    environment: { HBT_SERVER: "server:7000", HBT_TOKEN: "${HBT_TOKEN:-}", HBT_FINGERPRINT: "${HBT_FINGERPRINT:-}" }
     depends_on: [server, udp-echo]
     profiles: [clients]
