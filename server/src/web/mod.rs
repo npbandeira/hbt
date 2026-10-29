@@ -82,8 +82,8 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
 
 // ---------------------------------------------------------------- páginas
 
-async fn landing() -> Markup {
-    pages::landing()
+async fn landing(State(web): State<Arc<Web>>) -> Markup {
+    pages::landing(web.cfg.signup_open)
 }
 
 async fn login_page(State(web): State<Arc<Web>>, headers: HeaderMap) -> Response {

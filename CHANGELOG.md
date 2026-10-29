@@ -5,6 +5,14 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+### Mudou (interface do site)
+
+- **Site redesenhado** com a skill de design "tasteskill" (direção *One motif*): a porta numerada do hbt vira o disco magenta, que recorre como forma dos botões e da marca. Landing nova com um construtor de comando funcional (tipo de túnel e porta local geram o `hbt ...` e o endereço público), os três tipos de túnel, os quatro passos, os números medidos (perda de 0,05 % a 50 mil pacotes UDP por segundo, p99 de 3,7 ms, token conferido em 8,9 µs, com as condições do teste escritas) e o cadastro de verdade no fechamento.
+- Painel com a lista de tokens ao lado do formulário de criar token e o passo-a-passo de instalar e configurar um computador; login e cadastro mostram o que você recebe ao criar um token.
+- Fontes trocadas para League Spartan e Figtree, embutidas no binário (33 KB, antes 75 KB); a monoespaçada ficou só nos blocos de código, usando a do sistema.
+- A landing não oferece cadastro quando o servidor roda com `--signup closed`.
+- O tema escuro automático foi removido: a paleta "céu e areia" tem um tema só.
+
 ## [2.0.0] - 2026-10-29
 
 Versão maior porque o transporte mudou e **servidor e clientes antigos não conversam com os novos**: atualize os dois lados juntos, libere `7000/udp` e configure o fingerprint em cada cliente (`hbt configure --fingerprint ...`; o servidor mostra com `hbt-server fingerprint`). Os tokens existentes continuam valendo.

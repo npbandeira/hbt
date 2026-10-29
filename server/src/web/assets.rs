@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 const CSS: &[u8] = include_bytes!("../../assets/app.css");
 const JS: &[u8] = include_bytes!("../../assets/app.js");
 const HTMX: &[u8] = include_bytes!("../../assets/htmx.min.js");
-const LITERATA: &[u8] = include_bytes!("../../assets/literata.woff2");
-const MARTIAN_MONO: &[u8] = include_bytes!("../../assets/martian-mono.woff2");
+const LEAGUE_SPARTAN: &[u8] = include_bytes!("../../assets/league-spartan.woff2");
+const FIGTREE: &[u8] = include_bytes!("../../assets/figtree.woff2");
 
 /// Versão do conteúdo (hash FNV-1a de CSS+JS), usada como `?v=` para o
 /// navegador buscar de novo quando os arquivos mudam e poder guardar para sempre
@@ -36,8 +36,8 @@ pub async fn serve(Path(file): Path<String>) -> Response {
         "app.css" => ("text/css; charset=utf-8", CSS),
         "app.js" => ("text/javascript; charset=utf-8", JS),
         "htmx.min.js" => ("text/javascript; charset=utf-8", HTMX),
-        "literata.woff2" => ("font/woff2", LITERATA),
-        "martian-mono.woff2" => ("font/woff2", MARTIAN_MONO),
+        "league-spartan.woff2" => ("font/woff2", LEAGUE_SPARTAN),
+        "figtree.woff2" => ("font/woff2", FIGTREE),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (

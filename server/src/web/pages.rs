@@ -1,5 +1,6 @@
-//! HTML das páginas. As classes são do Tailwind (tema em `assets/tailwind.css`,
-//! que também define os componentes `btn`, `field`, `tray`, `notice` e `steps`).
+//! HTML das páginas. As classes são do Tailwind (tema e componentes em
+//! `assets/tailwind.css`). Direção visual: "One motif" (tasteskill): a porta
+//! numerada do hbt vira o disco magenta, que recorre como forma dos botões e da marca.
 
 use maud::{html, Markup, DOCTYPE};
 
@@ -28,9 +29,11 @@ pub fn quota(max: usize) -> String {
 /// formulário voltam como 422 e precisam ser trocados também.
 const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true},{"code":"[45]..","swap":false,"error":true}]}"#;
 
+const INSTALL: &str = "curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh";
+
 #[derive(Clone, Copy)]
 enum Nav<'a> {
-    Visitor,
+    Visitor { signup_open: bool },
     User(&'a str),
 }
 
@@ -41,36 +44,38 @@ fn shell(title: &str, nav: Nav<'_>, body: &Markup) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta name="color-scheme" content="light dark";
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 title { (title) " · hbt" }
                 link rel="stylesheet" href=(assets::url("app.css"));
+                // Sem defer de propósito: marca html.js antes da primeira pintura (as
+                // entradas só escondem o conteúdo quando há JavaScript para mostrá-lo).
+                script src=(assets::url("app.js")) {}
                 script src=(assets::url("htmx.min.js")) defer {}
-                script src=(assets::url("app.js")) defer {}
             }
-            body class="min-h-screen bg-concrete font-serif text-ink antialiased" {
-                header class="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-5 sm:px-6" {
-                    a href="/" class="font-mono text-xl font-bold tracking-tight" { "hbt" }
-                    nav class="flex items-center gap-5 text-base" {
+            body class="min-h-screen" {
+                header class="frame flex items-center justify-between gap-4 py-5" {
+                    a href="/" class="flex items-center gap-2 font-display text-lead font-bold tracking-tighter" aria-label="hbt, página inicial" {
+                        span class="disc size-4" aria-hidden="true" {}
+                        "hbt"
+                    }
+                    nav class="flex items-center gap-3 sm:gap-6" aria-label="Principal" {
                         @match nav {
-                            Nav::Visitor => {
+                            Nav::Visitor { signup_open } => {
+                                a href="#instalar" class="hidden underline-offset-4 hover:underline sm:inline" { "Instalar" }
                                 a href="/login" class="underline-offset-4 hover:underline" { "Entrar" }
-                                a href="/signup" class="btn btn-primary" { "Criar conta" }
+                                @if signup_open { a href="/signup" class="btn" { "Criar conta" } }
                             }
                             Nav::User(email) => {
                                 span class="hidden text-muted sm:inline" { (email) }
                                 a href="/dashboard" class="underline-offset-4 hover:underline" { "Painel" }
                                 form method="post" action="/logout" {
-                                    button type="submit" class="underline-offset-4 hover:underline cursor-pointer" { "Sair" }
+                                    button type="submit" class="cursor-pointer underline underline-offset-4" { "Sair" }
                                 }
                             }
                         }
                     }
                 }
-                main class="mx-auto max-w-5xl px-4 pb-20 sm:px-6" { (body) }
-                footer class="mx-auto max-w-5xl px-4 pb-10 text-sm text-muted sm:px-6" {
-                    "hbt-server " (env!("CARGO_PKG_VERSION"))
-                }
+                (body)
             }
         }
     }
@@ -78,228 +83,331 @@ fn shell(title: &str, nav: Nav<'_>, body: &Markup) -> Markup {
 
 // ---------------------------------------------------------------- landing
 
-/// O painel da landing: porta pública ligada à porta local por um cabo que se
-/// desenha uma vez ao abrir a página (veja `.cable` e `.led` no CSS).
-fn panel_diagram() -> Markup {
+/// Um fragmento de interface marcado `data-ui` (o inspetor trata como imagem).
+fn terminal(id: &str, command: &str, url: &str, local: &str) -> Markup {
     html! {
-        svg viewBox="0 0 480 270" class="w-full" role="img"
-            aria-label="Porta pública 24817 ligada por um cabo à porta local 3000" {
-            rect x="1" y="1" width="478" height="268" rx="6" class="fill-panel stroke-line" stroke-width="2" {}
-            // Portas: anel de latão e entrada escura.
-            g {
-                circle cx="96" cy="128" r="46" class="fill-concrete stroke-brass" stroke-width="5" {}
-                circle cx="96" cy="128" r="26" class="fill-ink" {}
-                circle cx="384" cy="128" r="46" class="fill-concrete stroke-brass" stroke-width="5" {}
-                circle cx="384" cy="128" r="26" class="fill-ink" {}
-            }
-            text x="96" y="46" text-anchor="middle" class="fill-muted font-serif text-base" { "público" }
-            text x="96" y="78" text-anchor="middle" class="fill-ink font-mono text-2xl font-bold" { "24817" }
-            text x="384" y="46" text-anchor="middle" class="fill-muted font-serif text-base" { "local" }
-            text x="384" y="78" text-anchor="middle" class="fill-ink font-mono text-2xl font-bold" { "3000" }
-            // Cabo: pathLength=1 normaliza o comprimento para a animação.
-            path d="M96 174 C 96 262, 384 262, 384 174" pathLength="1" fill="none"
-                class="cable stroke-cable" stroke-width="9" stroke-linecap="round" {}
-            g class="led" {
-                circle cx="204" cy="128" r="6" class="fill-led" {}
-                text x="218" y="133" class="fill-ink font-serif text-sm" { "conectado" }
+        div id=(id) data-ui class="ui-dark min-h-56 p-6 sm:p-8" role="tabpanel" {
+            pre class="whitespace-pre-wrap [overflow-wrap:anywhere] leading-relaxed" {
+                code { span class="text-sun" { "$ " } (command) "\n\n"
+                    "Forwarding    " (url) "  ->  " (local) }
             }
         }
     }
 }
 
-pub fn landing() -> Markup {
+pub fn landing(signup_open: bool) -> Markup {
+    let cta = if signup_open {
+        ("Criar conta", "/signup")
+    } else {
+        ("Entrar", "/login")
+    };
     shell(
         "Túnel reverso",
-        Nav::Visitor,
+        Nav::Visitor { signup_open },
         &html! {
-            section class="grid items-center gap-10 py-10 lg:grid-cols-[1.05fr_1fr] lg:py-16" {
-                div {
-                    h1 class="max-w-[16ch] text-4xl font-semibold leading-[1.08] tracking-tight sm:text-6xl" {
-                        "Sua máquina atrás do NAT, numa porta pública."
+            main {
+            // ------------------------------------------------------------ herói
+            section class="relative isolate overflow-hidden" {
+                div class="disc disc-settle absolute -z-10 aspect-square w-[min(120vh,110vw)] right-[-30vw] top-[38%] lg:right-[-28vw] lg:top-[-12vh]" aria-hidden="true" {}
+                div class="frame grid min-h-[min(calc(100svh-5rem),44rem)] items-center gap-12 pb-10 pt-4 lg:grid-cols-[1fr_minmax(0,34rem)] lg:pb-12" {
+                    div {
+                        h1 class="rise max-w-[14ch] text-display" { "Seu localhost, na internet." }
+                        p class="rise d1 mt-6 max-w-[40ch] text-lead" {
+                            "Crie uma conta, gere um token e cole um comando. O hbt abre a porta no servidor e leva o tráfego até o seu computador."
+                        }
+                        div class="rise d2 mt-8 flex flex-wrap gap-3" {
+                            a href=(cta.1) class="btn" { (cta.0) }
+                            a href="#instalar" class="btn btn-soft" { "Ver instalação" }
+                        }
                     }
-                    p class="mt-6 max-w-[42ch] text-lg leading-relaxed text-muted" {
-                        "Crie uma conta, gere um token e cole um comando. O hbt abre a porta no servidor e leva o tráfego até o seu computador."
+                    div id="builder" data-ui class="shutter ui-dark p-6 sm:p-8" {
+                        h2 class="font-sans text-lead font-semibold tracking-normal leading-snug" { "Qual serviço roda na sua máquina?" }
+                        div class="seg mt-4" role="tablist" aria-label="Tipo de túnel" {
+                            button type="button" role="tab" aria-selected="true" data-kind="http" { "Site (http)" }
+                            button type="button" role="tab" aria-selected="false" data-kind="tcp" { "TCP" }
+                            button type="button" role="tab" aria-selected="false" data-kind="udp" { "UDP" }
+                        }
+                        label class="mt-5 block" {
+                            span class="mb-1 block font-semibold" { "Porta local" }
+                            input id="builder-port" class="field max-w-40" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="5" value="3000" autocomplete="off";
+                        }
+                        p class="mt-6 font-semibold" { "Rode na sua máquina" }
+                        pre class="code mt-2" { code id="builder-cmd" { "hbt http 3000" } }
+                        p class="mt-5 font-semibold" { "O endereço público" }
+                        pre class="code mt-2" { code id="builder-addr" { "http://app.seu-servidor" } }
+                        button type="button" class="btn btn-soft mt-5 !border-sky !text-sky hover:!bg-sky hover:!text-ink" data-copy="#builder-cmd" { "Copiar comando" }
                     }
-                    div class="mt-8 flex flex-wrap gap-3" {
-                        a href="/signup" class="btn btn-primary" { "Criar conta" }
-                        a href="#instalar" class="btn" { "Ver instalação" }
-                    }
-                }
-                div { (panel_diagram()) }
-            }
-
-            section class="border-t border-line py-12" {
-                h2 class="text-2xl font-semibold" { "Como começar" }
-                ol class="steps mt-8 grid gap-8 sm:grid-cols-2 lg:grid-cols-4" {
-                    li { h3 class="font-semibold" { "Crie a conta" }
-                         p class="mt-1 text-muted" { "Com e-mail e senha, neste site." } }
-                    li { h3 class="font-semibold" { "Crie um token" }
-                         p class="mt-1 text-muted" { "No painel, dê um nome ao dispositivo." } }
-                    li { h3 class="font-semibold" { "Cole o comando" }
-                         p class="mt-1 text-muted" { "O painel mostra o " code class="font-mono text-sm" { "hbt configure" } " pronto." } }
-                    li { h3 class="font-semibold" { "Abra o túnel" }
-                         p class="mt-1 font-mono text-sm" { "hbt http 3000" } }
-                }
-            }
-
-            section class="border-t border-line py-12" {
-                h2 class="text-2xl font-semibold" { "Três tipos de túnel" }
-                p class="mt-2 max-w-[60ch] text-muted" {
-                    "Site, SSH, WireGuard, banco de dados: o que roda na sua máquina fica acessível de fora."
-                }
-                ul class="mt-8 divide-y divide-line border-y border-line" {
-                    (tunnel_row("hbt http 3000", "Um endereço web só seu", "http://app.seu-servidor"))
-                    (tunnel_row("hbt tcp 22", "Uma porta TCP pública", "tcp://seu-servidor:2xxxx"))
-                    (tunnel_row("hbt udp 51820", "Uma porta UDP pública, sem atraso extra", "udp://seu-servidor:2xxxx"))
                 }
             }
 
-            section id="instalar" class="border-t border-line py-12" {
-                h2 class="text-2xl font-semibold" { "Instalar" }
-                p class="mt-2 max-w-[60ch] text-muted" {
-                    "Linux e macOS. No Windows, baixe o " code class="font-mono text-sm" { "hbt-windows-x86_64.exe" }
-                    " na página de releases."
+            // ------------------------------------------------------- 3 tipos
+            section id="tipos" class="overflow-hidden bg-sand py-20 lg:py-24" {
+                div class="frame grid items-center gap-12 lg:grid-cols-[1fr_1.1fr]" {
+                    div {
+                        h2 class="reveal max-w-[12ch] text-head" { "Três tipos de túnel." }
+                        p class="reveal d1 mt-6 max-w-[40ch] text-lead" {
+                            "Site, SSH, WireGuard, banco de dados: o que roda na sua máquina fica acessível de fora."
+                        }
+                        div class="reveal d2 seg mt-8" role="tablist" aria-label="Escolha um túnel" id="kinds" {
+                            button type="button" role="tab" aria-selected="true" data-show="show-http" { "http" }
+                            button type="button" role="tab" aria-selected="false" data-show="show-tcp" { "tcp" }
+                            button type="button" role="tab" aria-selected="false" data-show="show-udp" { "udp" }
+                        }
+                        ul class="reveal d3 mt-6 max-w-[44ch] space-y-3" id="kind-facts" {
+                            li data-fact="show-http" { strong { "http: " } "um endereço web só seu, escolhido pelo servidor ou por você com " code { "--subdomain" } "." }
+                            li data-fact="show-tcp" { strong { "tcp: " } "uma porta pública dedicada, para SSH, bancos e qualquer serviço TCP." }
+                            li data-fact="show-udp" { strong { "udp: " } "UDP de verdade, sem fila: cada pacote vai e volta como datagrama, ótimo para WireGuard e jogos." }
+                        }
+                    }
+                    div class="reveal d2 relative grid place-items-center" {
+                        div class="disc aspect-square w-[min(56vh,86vw)] !bg-sun" aria-hidden="true" {}
+                        div class="absolute inset-0 m-auto h-fit w-[min(34rem,92%)]" id="kind-panels" {
+                            (terminal("show-http", "hbt http 3000", "http://a1b2c3d4.seu-servidor", "127.0.0.1:3000"))
+                            (terminal("show-tcp", "hbt tcp 22", "tcp://seu-servidor:24817", "127.0.0.1:22"))
+                            (terminal("show-udp", "hbt udp 51820", "udp://seu-servidor:24817", "127.0.0.1:51820"))
+                        }
+                    }
                 }
-                div class="mt-6 max-w-2xl" {
-                    (command_tray("install-cmd", "curl -fsSL https://github.com/npbandeira/hbt/releases/latest/download/install.sh | sh", "Copiar"))
+            }
+
+            // -------------------------------------------------------- passos + instalar
+            section class="py-20 lg:py-24" {
+                div class="frame" {
+                    h2 class="reveal max-w-[14ch] text-head" { "Quatro passos até o túnel." }
+                    ol data-ui class="reveal d1 mt-12 flex min-h-64 flex-col gap-1.5 lg:flex-row" {
+                        (stage("bg-accent text-accent-ink", "Crie a conta", &html! { "Com e-mail e senha, neste site." }))
+                        (stage("bg-ink text-sky", "Crie um token", &html! { "No painel, dê um nome ao dispositivo." }))
+                        (stage("bg-sun text-ink", "Cole o comando", &html! { "O painel mostra o " code { "hbt configure" } " pronto." }))
+                        (stage("bg-sand text-ink", "Abra o túnel", &html! { code { "hbt http 3000" } }))
+                    }
+                    div id="instalar" class="mt-24 grid scroll-mt-8 gap-10 lg:grid-cols-[1fr_1.1fr] lg:items-start" {
+                        div {
+                            h3 class="reveal max-w-[14ch] text-head" { "Instale o hbt." }
+                            p class="reveal d1 mt-4 max-w-[44ch]" {
+                                "Linux e macOS. No Windows, baixe o " code { "hbt-windows-x86_64.exe" } " na página de releases do projeto."
+                            }
+                            p class="reveal d2 mt-4 max-w-[44ch]" {
+                                "A conexão usa QUIC com TLS 1.3 e só aceita o certificado cujo fingerprint está no comando de configuração. O token nunca trafega: ele só assina um desafio."
+                            }
+                        }
+                        div data-ui class="reveal d2 ui-dark p-5 sm:p-7" {
+                            p class="font-semibold" { "1. Instale" }
+                            pre class="code mt-2" { code id="install-cmd" { (INSTALL) } }
+                            p class="mt-5 font-semibold" { "2. Cole o comando que o painel mostra" }
+                            pre class="code mt-2" { code { "hbt configure --server SEU_SERVIDOR --token SEU_TOKEN --fingerprint FINGERPRINT" } }
+                            button type="button" class="btn mt-5 !bg-sky !text-ink" data-copy="#install-cmd" { "Copiar a instalação" }
+                        }
+                    }
                 }
-                h3 class="mt-12 text-lg font-semibold" { "O que protege a conexão" }
-                p class="mt-2 max-w-[60ch] text-muted" {
-                    "O cliente fala com o servidor por QUIC com TLS 1.3 e só aceita o certificado cujo fingerprint está no comando de configuração. O token nunca trafega: ele só assina um desafio."
+            }
+
+            // ------------------------------------------------------------- medido
+            section class="bg-surface py-20 lg:py-24" {
+                div class="frame" {
+                    h2 class="reveal max-w-[12ch] text-head" { "Medido, não prometido." }
+                    div class="mt-12 grid gap-1.5 lg:grid-cols-12 lg:grid-rows-[auto_auto]" {
+                        div class="reveal d1 flex min-h-[56vw] flex-col justify-between rounded-2xl bg-accent p-6 text-accent-ink sm:p-8 lg:col-span-6 lg:row-span-2 lg:min-h-[70vh]" {
+                            p class="font-display text-display font-bold leading-none tracking-tighter" { "0,05%" }
+                            p class="max-w-[28ch] text-lead" { "de perda a 50 mil pacotes UDP por segundo." }
+                        }
+                        div class="reveal d2 flex min-h-48 flex-col justify-between rounded-2xl bg-ink p-6 text-sky lg:col-span-6 lg:col-start-7 lg:mt-12" {
+                            p class="font-display text-head font-bold leading-none tracking-tighter" { "3,7 ms" }
+                            p class="max-w-[30ch] text-lead" { "de latência no p99, nesse mesmo teste." }
+                        }
+                        div class="reveal d3 flex min-h-48 flex-col justify-between rounded-2xl bg-sun p-6 lg:col-span-4 lg:col-start-9" {
+                            p class="font-display text-head font-bold leading-none tracking-tighter" { "8,9 µs" }
+                            p class="max-w-[24ch] text-lead" { "para conferir um token entre 10 000." }
+                        }
+                    }
+                    p class="reveal mt-8 max-w-[56ch] text-sm" {
+                        "Teste de carga com o servidor limitado a 1 CPU e 2 GB, 10 origens e pacotes de 512 bytes, no loopback do Docker, sem perda de rede induzida. O roteiro e os números completos estão no guia do projeto."
+                    }
                 }
+            }
+
+            // -------------------------------------------------------------- fechamento
+            section class="overflow-hidden bg-accent py-20 text-accent-ink lg:py-0" {
+                div class="frame grid min-h-[72svh] items-center gap-12 lg:grid-cols-[1fr_minmax(0,28rem)]" {
+                    div {
+                        h2 class="reveal max-w-[12ch] text-display" { "Crie o primeiro token." }
+                        p class="reveal d1 mt-6 max-w-[38ch] text-lead" {
+                            "O token aparece uma única vez, junto com o comando pronto para colar no terminal."
+                        }
+                    }
+                    div data-ui class="reveal d2 ui p-6 text-ink sm:p-8" {
+                        @if signup_open {
+                            h3 class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Criar conta" }
+                            (auth_fields("/signup", "Criar conta", "new-password", "", None, &html! { span class="text-sm text-muted" { "Pelo menos 10 caracteres." } }))
+                            p class="mt-5" { "Já tem conta? " a href="/login" class="font-semibold underline underline-offset-4" { "Entrar" } }
+                        } @else {
+                            h3 class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Cadastro fechado" }
+                            p class="mt-3" { (SIGNUP_CLOSED) }
+                            a href="/login" class="btn mt-5" { "Entrar" }
+                        }
+                    }
+                }
+            }
+            }
+
+            // ------------------------------------------------------------ rodapé
+            footer class="overflow-hidden bg-ink pt-16 text-sky" {
+                div class="frame" {
+                    div class="flex flex-wrap items-start justify-between gap-8" {
+                        p class="max-w-[30ch] text-lead" { "Túnel reverso para TCP, UDP e HTTP." }
+                        nav class="flex flex-wrap gap-x-8 gap-y-3" aria-label="Rodapé" {
+                            a href="/login" class="underline underline-offset-4" { "Entrar" }
+                            @if signup_open { a href="/signup" class="underline underline-offset-4" { "Criar conta" } }
+                            a href="#instalar" class="underline underline-offset-4" { "Instalar" }
+                            a href="https://github.com/npbandeira/hbt/releases" class="underline underline-offset-4" { "Releases" }
+                        }
+                    }
+                    div class="mark mt-12" aria-hidden="true" {
+                        span class="h-[88%] bg-sun" { "h" }
+                        span class="h-[100%] bg-sky" { "b" }
+                        span class="h-[72%] bg-accent !text-accent-ink" { "t" }
+                    }
+                }
+                p class="frame pb-6 pt-4 text-sm" { "hbt-server " (env!("CARGO_PKG_VERSION")) }
             }
         },
     )
 }
 
-fn tunnel_row(command: &str, what: &str, result: &str) -> Markup {
+fn stage(color: &str, title: &str, clause: &Markup) -> Markup {
     html! {
-        li class="grid gap-1 py-4 sm:grid-cols-[14rem_1fr_auto] sm:items-baseline sm:gap-6" {
-            code class="font-mono text-base font-semibold" { (command) }
-            span { (what) }
-            span class="font-mono text-sm text-muted" { (result) }
-        }
-    }
-}
-
-/// Comando numa bandeja com botão de copiar (funciona sem JavaScript: o texto
-/// fica selecionável).
-fn command_tray(id: &str, command: &str, label: &str) -> Markup {
-    html! {
-        div class="flex flex-col gap-3 sm:flex-row sm:items-start" {
-            pre class="tray min-w-0 flex-1" { code id=(id) class="select-all whitespace-pre-wrap break-all" { (command) } }
-            button type="button" class="btn shrink-0" data-copy=(format!("#{id}")) { (label) }
+        li class=(format!("flex flex-1 flex-col justify-between gap-6 rounded-2xl p-6 min-h-36 lg:min-h-56 {color}")) {
+            h3 class="text-lead" { (title) }
+            p  { (clause) }
         }
     }
 }
 
 // ------------------------------------------------------------ cadastro/login
 
-/// O que muda entre as telas de entrar e de criar conta.
-struct AuthForm<'a> {
-    title: &'a str,
-    action: &'a str,
-    submit: &'a str,
-    autocomplete: &'a str,
-    email: &'a str,
-    error: Option<&'a str>,
+/// Os campos e o botão de um formulário de conta (usado nas telas e na landing).
+fn auth_fields(
+    action: &str,
+    submit: &str,
+    autocomplete: &str,
+    email: &str,
+    error: Option<&str>,
+    hint: &Markup,
+) -> Markup {
+    html! {
+        @if let Some(msg) = error {
+            p class="notice mt-5" role="alert" { (msg) }
+        }
+        form method="post" action=(action) hx-boost="true" class="mt-5 grid gap-5" {
+            label class="grid gap-1" {
+                span class="font-semibold" { "E-mail" }
+                input class="field" type="email" name="email" value=(email) required autocomplete="email";
+            }
+            label class="grid gap-1" {
+                span class="font-semibold" { "Senha" }
+                input class="field" type="password" name="password" required autocomplete=(autocomplete) maxlength="256";
+                (hint)
+            }
+            button type="submit" class="btn" { (submit) }
+        }
+    }
 }
 
-fn auth_page(f: &AuthForm<'_>, hint: &Markup, other: &Markup) -> Markup {
+/// A tela de conta: formulário à esquerda e, à direita, um campo de areia com o
+/// disco do motivo (o campo fecha o vão do outro lado da grade; some no celular).
+fn auth_page(title: &str, body: &Markup) -> Markup {
     html! {
-        section class="max-w-sm py-8" {
-            h1 class="text-3xl font-semibold tracking-tight" { (f.title) }
-            @if let Some(msg) = f.error {
-                p class="notice mt-6" role="alert" { (msg) }
-            }
-            form method="post" action=(f.action) hx-boost="true" class="mt-6 grid gap-5" {
-                label class="grid gap-1" {
-                    span class="text-sm font-semibold" { "E-mail" }
-                    input class="field" type="email" name="email" value=(f.email) required autofocus autocomplete="email";
+        main class="grid min-h-[calc(100svh-5rem)] lg:grid-cols-2" {
+            div class="flex items-center px-[var(--margin)] pb-16 pt-6" {
+                div class="w-full max-w-md" {
+                    h1 class="text-lead" { (title) }
+                    (body)
                 }
-                label class="grid gap-1" {
-                    span class="text-sm font-semibold" { "Senha" }
-                    input class="field" type="password" name="password" required autocomplete=(f.autocomplete) maxlength="256";
-                    (hint)
-                }
-                button type="submit" class="btn btn-primary" { (f.submit) }
             }
-            p class="mt-6 text-muted" { (other) }
+            div class="relative hidden place-items-center overflow-hidden bg-sand lg:grid" {
+                div class="disc aspect-square w-[min(62%,62vh)]" aria-hidden="true" {}
+                div data-ui class="ui-dark absolute inset-0 m-auto h-fit w-[min(30rem,88%)] p-6 sm:p-8" {
+                    p class="font-semibold" { "O que você recebe ao criar um token" }
+                    pre class="code mt-3" { code { "hbt configure --server SEU_SERVIDOR --token a1b2c3d4.… --fingerprint 7236ee…" } }
+                    p class="mt-4 text-sm" { "Exemplo. O token de verdade aparece uma única vez, no painel." }
+                }
+            }
         }
     }
 }
 
 pub fn login(error: Option<&str>, email: &str) -> Markup {
-    let form = AuthForm {
-        title: "Entrar",
-        action: "/login",
-        submit: "Entrar",
-        autocomplete: "current-password",
-        email,
-        error,
-    };
     shell(
         "Entrar",
-        Nav::Visitor,
+        Nav::Visitor { signup_open: true },
         &auth_page(
-            &form,
-            &html! {},
-            &html! { "Ainda não tem conta? " a href="/signup" class="text-cable underline underline-offset-4" { "Criar conta" } },
+            "Entrar",
+            &html! {
+                (auth_fields("/login", "Entrar", "current-password", email, error, &html! {}))
+                p class="mt-6" { "Ainda não tem conta? " a href="/signup" class="font-semibold underline underline-offset-4" { "Criar conta" } }
+            },
         ),
     )
 }
 
 pub fn signup(open: bool, error: Option<&str>, email: &str) -> Markup {
-    let form = AuthForm {
-        title: "Criar conta",
-        action: "/signup",
-        submit: "Criar conta",
-        autocomplete: "new-password",
-        email,
-        error,
-    };
-    let other = html! { "Já tem conta? " a href="/login" class="text-cable underline underline-offset-4" { "Entrar" } };
     let body = if open {
-        auth_page(
-            &form,
-            &html! { span class="text-sm text-muted" { "Pelo menos 10 caracteres." } },
-            &other,
-        )
+        html! {
+            (auth_fields("/signup", "Criar conta", "new-password", email, error, &html! { span class="text-sm text-muted" { "Pelo menos 10 caracteres." } }))
+            p class="mt-6" { "Já tem conta? " a href="/login" class="font-semibold underline underline-offset-4" { "Entrar" } }
+        }
     } else {
         html! {
-            section class="max-w-sm py-8" {
-                h1 class="text-3xl font-semibold tracking-tight" { "Criar conta" }
-                p class="notice mt-6" role="alert" { (SIGNUP_CLOSED) }
-                p class="mt-6 text-muted" { (other) }
-            }
+            p class="notice mt-5" role="alert" { (SIGNUP_CLOSED) }
+            p class="mt-6" { "Já tem conta? " a href="/login" class="font-semibold underline underline-offset-4" { "Entrar" } }
         }
     };
-    shell("Criar conta", Nav::Visitor, &body)
+    shell(
+        "Criar conta",
+        Nav::Visitor { signup_open: open },
+        &auth_page("Criar conta", &body),
+    )
 }
 
 // ---------------------------------------------------------------- painel
 
 pub fn dashboard(email: &str, tokens: &[TokenRecord], online: &[bool]) -> Markup {
+    let connected = online.iter().filter(|o| **o).count();
     shell(
         "Painel",
         Nav::User(email),
         &html! {
-            section class="py-8" {
-                h1 class="text-3xl font-semibold tracking-tight" { "Seus tokens" }
-                p class="mt-2 max-w-[60ch] text-muted" {
-                    "Cada token autentica um computador. O comando de configuração aparece só no momento em que você cria o token."
+            main class="frame pb-24 pt-6" {
+                h1 class="text-lead" { "Seus tokens" }
+                p class="mt-2 max-w-[60ch]" {
+                    @if tokens.is_empty() {
+                        "Cada token autentica um computador. O comando de configuração aparece só quando você cria o token."
+                    } @else {
+                        (connected) " de " (tokens.len()) " conectados agora. O comando de configuração aparece só quando você cria o token."
+                    }
                 }
 
-                ul id="token-rows" class="mt-8 divide-y divide-line border-y border-line" {
-                    @for (t, on) in tokens.iter().zip(online) { (token_row(t, *on)) }
+                div class="mt-8 grid gap-x-10 gap-y-12 lg:grid-cols-[minmax(0,1fr)_26rem] lg:items-start" {
+                    div class="lg:col-start-1 lg:row-start-1" {
+                        ul id="token-rows" {
+                            @for (t, on) in tokens.iter().zip(online) { (token_row(t, *on)) }
+                        }
+                        @if tokens.is_empty() {
+                            p id="empty" class="rounded-2xl bg-surface px-5 py-6" { "Você ainda não tem tokens. Crie o primeiro ao lado." }
+                        }
+                    }
+                    aside class="rounded-2xl bg-surface p-6 lg:col-start-2 lg:row-span-2 lg:row-start-1" {
+                        h2 class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Criar token" }
+                        (create_form(false))
+                        div id="new-token" class="mt-6" aria-live="polite" {}
+                    }
+                    section class="rounded-2xl bg-ink p-6 text-sky sm:p-8 lg:col-start-1 lg:row-start-2" {
+                        h2 class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Configurar um computador" }
+                        p class="mt-4 font-semibold" { "1. Instale o hbt" }
+                        pre class="code mt-2" { code { (INSTALL) } }
+                        p class="mt-4 font-semibold" { "2. Cole o comando do token" }
+                        p class="mt-1" { "Ele aparece ao criar o token. Depois é só abrir o túnel, por exemplo " code { "hbt http 3000" } "." }
+                    }
                 }
-                @if tokens.is_empty() {
-                    p id="empty" class="mt-4 text-muted" { "Você ainda não tem tokens. Crie o primeiro abaixo." }
-                }
-
-                h2 class="mt-12 text-xl font-semibold" { "Criar token" }
-                (create_form(false))
-                div id="new-token" class="mt-6 max-w-2xl" aria-live="polite" {}
             }
         },
     )
@@ -308,12 +416,12 @@ pub fn dashboard(email: &str, tokens: &[TokenRecord], online: &[bool]) -> Markup
 fn create_form(oob: bool) -> Markup {
     html! {
         form id="create-form" hx-post="/tokens" hx-target="#new-token" hx-swap="innerHTML"
-            hx-swap-oob=[oob.then_some("true")] class="mt-4 flex max-w-xl flex-col gap-3 sm:flex-row sm:items-end" {
-            label class="grid flex-1 gap-1" {
-                span class="text-sm font-semibold" { "Nome do dispositivo" }
+            hx-swap-oob=[oob.then_some("true")] class="mt-4 grid gap-4" {
+            label class="grid gap-1" {
+                span class="font-semibold" { "Nome do dispositivo" }
                 input class="field" type="text" name="name" required maxlength="64" placeholder="notebook" autocomplete="off";
             }
-            button type="submit" class="btn btn-primary" { "Criar token" }
+            button type="submit" class="btn" { "Criar token" }
         }
     }
 }
@@ -321,16 +429,16 @@ fn create_form(oob: bool) -> Markup {
 fn token_row(t: &TokenRecord, online: bool) -> Markup {
     let dom = format!("tok-{}", t.id);
     html! {
-        li id=(dom) class="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1 py-4 sm:grid-cols-[auto_1fr_auto_auto]" {
-            span class=(if online { "lamp lamp-on" } else { "lamp" }) {
-                span class="sr-only" { (if online { "Conectado" } else { "Desconectado" }) }
-            }
+        li id=(dom) class="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 border-b border-ink/15 py-4 sm:grid-cols-[minmax(0,1fr)_9rem_auto]" {
             span class="min-w-0" {
-                span class="block truncate font-semibold" { (t.name) }
-                span class="block font-mono text-sm text-muted" { (t.id) }
+                span class="block truncate text-lead font-semibold" { (t.name) }
+                span class="block text-sm tabular-nums text-muted" { (t.id) " · criado em " (format_date(t.created_at)) }
             }
-            span class="hidden text-sm text-muted sm:block" { "criado em " (format_date(t.created_at)) }
-            button type="button" class="btn btn-quiet" hx-delete=(format!("/tokens/{}", t.id))
+            span class="flex items-center gap-2" {
+                span class=(if online { "dot dot-on" } else { "dot" }) aria-hidden="true" {}
+                (if online { "Conectado" } else { "Desconectado" })
+            }
+            button type="button" class="btn btn-quiet justify-self-start !px-0 sm:justify-self-end sm:!px-3" hx-delete=(format!("/tokens/{}", t.id))
                 hx-target=(format!("#{dom}")) hx-swap="outerHTML"
                 hx-confirm=(format!("Revogar o token \"{}\"? O túnel que usa esse token cai em até 10 segundos.", t.name)) {
                 "Revogar"
@@ -344,10 +452,11 @@ fn token_row(t: &TokenRecord, online: bool) -> Markup {
 /// trocas "fora de banda" do htmx.
 pub fn token_created(rec: &TokenRecord, command: &str) -> Markup {
     html! {
-        div class="grid gap-3" {
-            p class="font-semibold" { "Token criado" }
-            p class="text-muted" { "Ele aparece só agora. Copie o comando antes de sair desta página." }
-            (command_tray("new-command", command, "Copiar comando"))
+        div data-ui class="ui-dark grid gap-3 p-5 sm:p-6" {
+            p class="font-display text-lead font-bold leading-none tracking-tighter" { "Token criado." }
+            p { "Ele aparece só agora. Copie o comando antes de sair desta página." }
+            pre class="code" { code id="new-command" { (command) } }
+            div { button type="button" class="btn !bg-sky !text-ink" data-copy="#new-command" { "Copiar comando" } }
         }
         ul id="token-rows" hx-swap-oob="beforeend" { (token_row(rec, false)) }
         p id="empty" hx-swap-oob="delete" {}
@@ -390,17 +499,32 @@ mod tests {
     }
 
     #[test]
-    fn closed_signup_shows_no_form() {
+    fn closed_signup_shows_no_form_anywhere() {
         let html = signup(false, None, "").into_string();
         assert!(html.contains(SIGNUP_CLOSED));
         assert!(!html.contains("name=\"password\""));
+        let landing = landing(false).into_string();
+        assert!(
+            !landing.contains("name=\"password\""),
+            "a landing não oferece cadastro fechado"
+        );
+        assert!(!landing.contains("href=\"/signup\""));
+    }
+
+    #[test]
+    fn landing_offers_signup_when_open() {
+        let html = landing(true).into_string();
+        assert!(html.contains("action=\"/signup\""));
+        assert!(html.contains("Seu localhost, na internet."));
+        assert!(html.contains(INSTALL));
     }
 
     #[test]
     fn pages_have_no_inline_script_or_style() {
         // O CSP não deixa nenhum dos dois: se aparecer um, o site quebra.
         for page in [
-            landing(),
+            landing(true),
+            landing(false),
             login(None, ""),
             signup(true, None, ""),
             dashboard("a@b.co", &[], &[]),
@@ -409,7 +533,8 @@ mod tests {
             assert!(!html.contains("<style"), "estilo inline");
             assert!(!html.contains(" style=\""), "atributo style");
             assert!(!html.contains("onclick="), "handler inline");
-            assert_eq!(html.matches("<script").count(), 2, "só htmx e app.js");
+            assert_eq!(html.matches("<script").count(), 2, "só app.js e htmx");
+            assert_eq!(html.matches("<script src=").count(), 2);
         }
     }
 }
