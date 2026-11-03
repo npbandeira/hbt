@@ -124,3 +124,31 @@ async fn port_outside_server_range_is_refused() {
     sleep(Duration::from_millis(1500)).await;
     assert!(TcpStream::connect(("127.0.0.1", denied)).await.is_err());
 }
+
+#[tokio::test]
+async fn tunnel_cap_is_per_token() {
+    let (p1, p2, p3) = (free_port(), free_port(), free_port());
+    let fx = Fixture::start(
+        &format!("{}-{}", p1.min(p2).min(p3), p1.max(p2).max(p3)),
+        &["--max-tunnels-per-token", "1"],
+    );
+    let (a, b) = (fx.token("a", &[]), fx.token("b", &[]));
+    let echo = tcp_echo_server().await;
+    let tcp = |t: &str, p: u16| fx.client(t, &["tcp", &echo.to_string(), "--remote-port", &p.to_string()]);
+
+    let _first = spawn_quiet(tcp(&a, p1));
+    assert!(tcp_echo_works(p1).await, "primeiro túnel nunca respondeu");
+
+    // Mesmo token, segundo túnel: recusado, a porta não abre e o primeiro segue de pé.
+    let _second = spawn_quiet(tcp(&a, p2));
+    sleep(Duration::from_secs(2)).await;
+    assert!(
+        TcpStream::connect(("127.0.0.1", p2)).await.is_err(),
+        "o segundo túnel passou do teto"
+    );
+    assert!(tcp_echo_works(p1).await, "o primeiro túnel caiu");
+
+    // Outro token tem o próprio teto.
+    let _other = spawn_quiet(tcp(&b, p3));
+    assert!(tcp_echo_works(p3).await, "o teto vazou para outro token");
+}

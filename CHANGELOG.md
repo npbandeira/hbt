@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-11-03
+
+Protocolo e banco iguais aos da 2.0.x: basta atualizar o `hbt-server`.
+
 ### Segurança
 
 - **Teto de túneis simultâneos por token** (`--max-tunnels-per-token`, padrão 2). Com cadastro aberto, uma conta podia abrir túneis sem limite e esgotar a faixa de portas públicas. O padrão 2 deixa uma sessão antiga ainda não expirada (até ~10 s) conviver com a reconexão.
@@ -109,7 +113,8 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/npbandeira/hbt/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/npbandeira/hbt/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/npbandeira/hbt/compare/v0.1.1...v2.0.0
 [0.1.1]: https://github.com/npbandeira/hbt/compare/v0.1.0...v0.1.1
