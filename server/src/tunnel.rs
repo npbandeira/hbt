@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::control::Bound;
 use crate::metrics::{ConnError, Kind, Metrics};
-use crate::state::State;
+use crate::state::{OnlineGuard, State};
 use crate::tokens::TokenRecord;
 
 /// Vive enquanto o cliente estiver conectado.
@@ -30,6 +30,7 @@ pub async fn run_tunnel(
     bound: Bound,
     record: TokenRecord,
     opener: Opener,
+    _online: OnlineGuard,
 ) -> Result<()> {
     let (rd, mut wr) = tokio::io::split(ctl);
     let mut rd = BufReader::new(rd);
@@ -47,7 +48,6 @@ pub async fn run_tunnel(
         }
     }));
 
-    let _online = state.mark_online(&record.id);
     let _session = state.metrics.session(match bound {
         Bound::Tcp(_) => Kind::Tcp,
         Bound::Udp(_) => Kind::Udp,

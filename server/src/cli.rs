@@ -137,6 +137,10 @@ pub struct ServeArgs {
     /// Quantos tokens cada conta do site pode ter.
     #[arg(long, env = "HBT_MAX_TOKENS_PER_USER", default_value_t = 5)]
     pub max_tokens_per_user: usize,
+
+    /// Túneis simultâneos por token (cada um ocupa uma porta pública).
+    #[arg(long, env = "HBT_MAX_TUNNELS_PER_TOKEN", default_value_t = 2)]
+    pub max_tunnels_per_token: usize,
 }
 
 fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {

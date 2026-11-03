@@ -163,6 +163,7 @@ mod tests {
             routes: Mutex::new(HashMap::new()),
             metrics: Arc::default(),
             online: Mutex::default(),
+            max_tunnels: 2,
         }
     }
 

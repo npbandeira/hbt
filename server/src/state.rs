@@ -36,21 +36,26 @@ pub struct State {
     pub metrics: Arc<Metrics>,
     /// token id -> sessões de túnel abertas agora (o painel do site mostra o LED).
     pub online: Mutex<HashMap<String, usize>>,
+    /// Teto de túneis simultâneos por token (as portas públicas são finitas).
+    pub max_tunnels: usize,
 }
 
 impl State {
-    /// Marca o token como conectado até o guard cair.
-    pub fn mark_online(self: &Arc<Self>, token_id: &str) -> OnlineGuard {
-        *self
-            .online
-            .lock()
-            .unwrap()
-            .entry(token_id.to_owned())
-            .or_default() += 1;
-        OnlineGuard {
+    /// Marca o token como conectado até o guard cair; `None` se já está no teto.
+    pub fn mark_online(self: &Arc<Self>, token_id: &str) -> Option<OnlineGuard> {
+        let mut online = self.online.lock().unwrap();
+        let n = online.entry(token_id.to_owned()).or_default();
+        if *n >= self.max_tunnels {
+            if *n == 0 {
+                online.remove(token_id);
+            }
+            return None;
+        }
+        *n += 1;
+        Some(OnlineGuard {
             state: self.clone(),
             token_id: token_id.to_owned(),
-        }
+        })
     }
 
     pub fn is_online(&self, token_id: &str) -> bool {
@@ -91,5 +96,32 @@ pub struct RouteGuard {
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         self.state.routes.lock().unwrap().remove(&self.subdomain);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Store;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn online_cap_per_token_frees_on_drop() {
+        let state = Arc::new(State {
+            store: Store::memory().unwrap(),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port_range: 20000..=30000,
+            http: None,
+            routes: Mutex::default(),
+            metrics: Arc::default(),
+            online: Mutex::default(),
+            max_tunnels: 2,
+        });
+        let a = state.mark_online("t").unwrap();
+        let _b = state.mark_online("t").unwrap();
+        assert!(state.mark_online("t").is_none());
+        assert!(state.mark_online("outro").is_some(), "o teto é por token");
+        drop(a);
+        assert!(state.mark_online("t").is_some());
     }
 }

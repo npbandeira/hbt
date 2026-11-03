@@ -42,6 +42,7 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<
         routes: Mutex::new(HashMap::new()),
         metrics: Arc::default(),
         online: Mutex::default(),
+        max_tunnels: args.max_tunnels_per_token,
     });
 
     let control_addr = lookup_host(&args.control_bind)

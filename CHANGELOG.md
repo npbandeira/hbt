@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+### Segurança
+
+- **Teto de túneis simultâneos por token** (`--max-tunnels-per-token`, padrão 2). Com cadastro aberto, uma conta podia abrir túneis sem limite e esgotar a faixa de portas públicas. O padrão 2 deixa uma sessão antiga ainda não expirada (até ~10 s) conviver com a reconexão.
+
 ## [2.0.1] - 2026-10-29
 
 Só a interface do site mudou: o protocolo e o banco são os mesmos da 2.0.0, então servidor e clientes 2.0.0 continuam compatíveis. Basta atualizar o `hbt-server`.

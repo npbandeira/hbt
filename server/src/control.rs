@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 use tracing::info;
 
-use crate::state::{RouteGuard, State};
+use crate::state::{OnlineGuard, RouteGuard, State};
 use crate::tokens::TokenRecord;
 use crate::tunnel::run_tunnel;
 
@@ -51,7 +51,7 @@ pub async fn handle_conn(incoming: quinn::Incoming, state: Arc<State>) -> Result
     )
     .await
     {
-        Ok(Ok((bound, rec))) => run_tunnel(stream, conn, state, bound, rec, opener).await,
+        Ok(Ok((bound, rec, online))) => run_tunnel(stream, conn, state, bound, rec, opener, online).await,
         Ok(Err(e)) => {
             state.metrics.handshake_failed();
             reject(&mut stream, &conn, e.to_string()).await;
@@ -78,7 +78,7 @@ async fn negotiate(
     state: &Arc<State>,
     opener: &Opener,
     token_id: &str,
-) -> Result<(Bound, TokenRecord)> {
+) -> Result<(Bound, TokenRecord, OnlineGuard)> {
     // Id desconhecido recebe o desafio igual a um id válido e falha só depois
     // da verificação, com a MESMA mensagem: assim não dá para descobrir quais
     // ids existem (user enumeration) olhando respostas ou tempo.
@@ -98,6 +98,12 @@ async fn negotiate(
     let Some(record) = record.filter(|_| valid) else {
         state.metrics.auth_failed();
         bail!("autenticação falhou");
+    };
+    let Some(online) = state.mark_online(&record.id) else {
+        bail!(
+            "o token '{}' já está no limite de túneis simultâneos",
+            record.name
+        );
     };
     write_msg(stream, &ServerMsg::AuthOk).await?;
     info!("cliente '{}' autenticado", record.name);
@@ -120,7 +126,7 @@ async fn negotiate(
         TunnelSpec::Http { subdomain } => register_http(state, opener, subdomain, &record)?,
     };
     write_msg(stream, &ServerMsg::Registered { public }).await?;
-    Ok((bound, record))
+    Ok((bound, record, online))
 }
 
 /// Faixa que ESTE cliente pode usar: faixa global do servidor ∩ faixa do token.
