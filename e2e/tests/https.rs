@@ -117,7 +117,8 @@ async fn https_serves_tunnels_and_site_and_http_redirects() {
 
     // Porta 80: redireciona (com caminho), para nomes nossos só.
     let r = http_get(edge, "demo.hbt.localhost").await;
-    assert!(r.starts_with("HTTP/1.1 308"), "{r:?}");
+    // Porta de teste (não 443): redirecionamento temporário.
+    assert!(r.starts_with("HTTP/1.1 307"), "{r:?}");
     assert!(
         r.contains(&format!("Location: https://demo.hbt.localhost:{tls_port}/\r\n")),
         "{r:?}"

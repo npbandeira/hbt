@@ -114,13 +114,16 @@ where
         // Só para nomes nossos: não vira redirecionador para qualquer Host.
         let ours = http.is_some_and(|h| name == h.domain || name.ends_with(&format!(".{}", h.domain)));
         if let Some(port) = http.and_then(|h| h.https_port()).filter(|_| ours) {
-            let port = if port == 443 {
-                String::new()
+            // Na 443 é definitivo (308, o navegador memoriza). Em outra porta é
+            // quase sempre um teste lado a lado (p.ex. 8443 antes de trocar o
+            // Caddy): 307, para não prender visitantes nela depois da troca.
+            let (status, port) = if port == 443 {
+                ("308 Permanent Redirect", String::new())
             } else {
-                format!(":{port}")
+                ("307 Temporary Redirect", format!(":{port}"))
             };
             let to = format!("https://{name}{port}{path}");
-            respond(&mut public, "308 Permanent Redirect", &to, Some(&to)).await;
+            respond(&mut public, status, &to, Some(&to)).await;
             return Ok(());
         }
     }

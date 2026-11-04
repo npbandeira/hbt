@@ -32,6 +32,7 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::rustls::{crypto, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
+use x509_parser::extensions::GeneralName;
 
 /// Quanto esperar depois de gravar o TXT antes de pedir a validação: o Let's
 /// Encrypt consulta os servidores do DuckDNS de vários pontos da internet.
@@ -50,6 +51,10 @@ struct Loaded {
     key: Arc<CertifiedKey>,
     not_before: u64,
     not_after: u64,
+    /// Emitido pelo ambiente de testes do Let's Encrypt (`--acme-staging`).
+    staging: bool,
+    /// Nomes DNS do certificado (SAN), em minúsculas.
+    names: Vec<String>,
 }
 
 impl std::fmt::Debug for CertStore {
@@ -118,10 +123,19 @@ impl CertStore {
 
     /// Precisa renovar? Sim sem certificado ou no último terço da validade
     /// (30 dias de 90 no Let's Encrypt; acompanha se a validade encurtar).
-    fn due(&self, now: u64) -> bool {
+    /// Precisa pedir certificado ao ACME? Sim se não há, se está no último terço
+    /// da validade, se veio do outro ambiente (staging x produção) ou se não
+    /// cobre `<domínio>` e `*.<domínio>` (domínio trocado).
+    fn due(&self, now: u64, acme: &Acme) -> bool {
         match &*self.current.read().unwrap() {
             None => true,
-            Some(c) => now + (c.not_after.saturating_sub(c.not_before)) / 3 >= c.not_after,
+            Some(c) => {
+                let covers = |n: &str| c.names.iter().any(|x| x == n);
+                now + (c.not_after.saturating_sub(c.not_before)) / 3 >= c.not_after
+                    || c.staging != acme.staging
+                    || !covers(&acme.domain)
+                    || !covers(&format!("*.{}", acme.domain))
+            }
         }
     }
 
@@ -145,11 +159,31 @@ fn parse(cert_pem: &[u8], key_pem: &[u8]) -> Result<Loaded> {
     let signer = crypto::ring::sign::any_supported_type(&key).context("tipo de chave não suportado")?;
     let (_, x509) = x509_parser::parse_x509_certificate(&chain[0]).context("cert.pem ilegível")?;
     let validity = x509.validity();
-    Ok(Loaded {
+    let names = x509
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|san| {
+            san.value
+                .general_names
+                .iter()
+                .filter_map(|n| match n {
+                    GeneralName::DNSName(d) => Some(d.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // As CAs do staging do Let's Encrypt levam "(STAGING)" no nome.
+    let staging = x509.issuer().to_string().contains("(STAGING)");
+    let loaded = Loaded {
         not_before: u64::try_from(validity.not_before.timestamp()).unwrap_or(0),
         not_after: u64::try_from(validity.not_after.timestamp()).unwrap_or(0),
+        staging,
+        names,
         key: Arc::new(CertifiedKey::new(chain, signer)),
-    })
+    };
+    Ok(loaded)
 }
 
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
@@ -195,7 +229,7 @@ pub fn duckdns_name(domain: &str) -> Result<&str> {
 pub async fn keep_fresh(store: Arc<CertStore>, acme: Option<Acme>) {
     loop {
         let wait = match &acme {
-            Some(acme) if store.due(now()) => match issue(&store, acme).await {
+            Some(acme) if store.due(now(), acme) => match issue(&store, acme).await {
                 Ok(()) => Duration::from_secs(12 * 60 * 60),
                 Err(e) => {
                     warn!("não consegui emitir o certificado HTTPS: {e:#} (tento de novo em 1 h)");
@@ -361,22 +395,58 @@ mod tests {
         assert!(duckdns_name("tunnel.exemplo.com").is_err());
     }
 
+    fn acme(domain: &str, staging: bool) -> Acme {
+        Acme {
+            domain: domain.into(),
+            duckdns_token: String::new(),
+            email: None,
+            staging,
+        }
+    }
+
+    /// Certificado autoassinado para `x.test` e `*.x.test`; o emissor é o próprio
+    /// sujeito, então `issuer_cn` simula a CA (`(STAGING) ...` no staging).
+    fn store_with(tag: &str, issuer_cn: &str) -> (Arc<CertStore>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hbt-tls-{tag}-{}", std::process::id()));
+        let store = CertStore::open(&dir).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["x.test".into(), "*.x.test".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, issuer_cn);
+        let cert = params.self_signed(&key).unwrap();
+        store.install(&cert.pem(), &key.serialize_pem()).unwrap();
+        (store, dir)
+    }
+
     #[test]
     fn installs_and_renews_in_the_last_third() {
-        let dir = std::env::temp_dir().join(format!("hbt-tls-{}", std::process::id()));
-        let store = CertStore::open(&dir).unwrap();
-        assert!(!store.ready() && store.due(now()));
+        let dir = std::env::temp_dir().join(format!("hbt-tls-empty-{}", std::process::id()));
+        let empty = CertStore::open(&dir).unwrap();
+        assert!(!empty.ready() && empty.due(now(), &acme("x.test", false)));
 
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["x.test".into()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        store.install(&cert.pem(), &key.serialize_pem()).unwrap();
+        let (store, dir) = store_with("third", "Let's Encrypt R10");
         assert!(store.ready());
         let c = store.current.read().unwrap().clone().unwrap();
-        assert!(!store.due(c.not_before));
-        assert!(store.due(c.not_after - (c.not_after - c.not_before) / 4));
+        let prod = acme("x.test", false);
+        assert!(!store.due(c.not_before, &prod));
+        assert!(store.due(c.not_after - (c.not_after - c.not_before) / 4, &prod));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reissues_when_environment_or_domain_changes() {
+        let (staging, dir) = store_with("staging", "(STAGING) Ersatz Edamame E1");
+        let at = staging.current.read().unwrap().clone().unwrap().not_before;
+        // Saiu do --acme-staging: o certificado de teste não pode ficar 60 dias.
+        assert!(staging.due(at, &acme("x.test", false)));
+        assert!(!staging.due(at, &acme("x.test", true)));
+        let _ = fs::remove_dir_all(&dir);
+
+        let (prod, dir) = store_with("prod", "Let's Encrypt R10");
+        assert!(prod.due(at, &acme("x.test", true)));
+        assert!(!prod.due(at, &acme("x.test", false)));
+        assert!(prod.due(at, &acme("outro.test", false)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

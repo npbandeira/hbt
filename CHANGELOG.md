@@ -5,6 +5,11 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+### Corrigido
+
+- Ao sair do `--acme-staging`, o servidor continuava servindo o certificado de teste por até 60 dias. Agora pede um novo na hora quando o certificado em uso é do outro ambiente (staging x produção) ou não cobre `<domínio>` e `*.<domínio>` (domínio trocado).
+- Com `--https-bind` fora da 443 (p.ex. testando na 8443 com o Caddy ainda na 443), a porta 80 redirecionava com 308, que o navegador memoriza. Fora da 443 o redirecionamento passa a ser 307 (temporário); na 443 continua 308.
+
 ## [2.1.0] - 2026-11-03
 
 Protocolo igual ao da 2.0.x: clientes 2.0 continuam funcionando, basta atualizar o `hbt-server`. O banco ganha a tabela de reservas sozinho na primeira abertura.

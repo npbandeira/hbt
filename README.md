@@ -148,8 +148,11 @@ O DuckDNS já resolve qualquer `*.meuhbt.duckdns.org` para o mesmo IP, então n�
 há DNS wildcard a criar. Em outro provedor de DNS, gere o certificado por fora
 (p.ex. certbot) e copie `cert.pem` e `key.pem` para `<data-dir>/tls/`: o servidor
 relê os arquivos de hora em hora. Para testar a configuração sem gastar a cota do
-Let's Encrypt, use `--acme-staging` (o certificado sai, mas não é confiável).
-Enquanto não há certificado, tudo segue em http.
+Let's Encrypt, use `--acme-staging` (o certificado sai, mas não é confiável);
+ao tirar a flag, o servidor troca sozinho pelo certificado de produção.
+Enquanto não há certificado, tudo segue em http. A porta 80 redireciona para
+https com 308 quando o HTTPS está na 443, e com 307 (temporário) em outra porta,
+para dar para testar numa porta alta sem prender os navegadores nela.
 
 **Testar tudo na própria máquina**, sem VPS nem DNS: `./scripts/demo-local.sh`
 roda tudo automaticamente. Na mão:
