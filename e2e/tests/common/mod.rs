@@ -29,14 +29,43 @@ pub fn bin_dir() -> PathBuf {
     p
 }
 
-/// Pede uma porta livre ao SO (bind na porta 0) e a devolve.
-/// Há uma pequena janela de corrida até o processo usá-la; aceitável em testes.
+/// Uma porta livre (TCP e UDP) para o servidor de teste usar.
+///
+/// Não usa a porta 0 do SO: ela vem da faixa efêmera, a mesma das conexões de
+/// saída, e com muitos testes em paralelo uma conexão podia pegar a porta antes do
+/// servidor, que então morria com "endereço em uso" (falha intermitente no CI).
+/// Aqui as portas vêm de 15000-29999, fora da faixa efêmera do Linux
+/// (32768-60999) e do macOS (49152+), e um contador nunca repete uma porta dentro
+/// do mesmo binário de teste (os binários rodam um de cada vez).
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    free_ports(1)
+}
+
+/// `n` portas livres seguidas (para faixas como `--port-range A-B`); devolve a primeira.
+pub fn free_ports(n: u16) -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const BASE: u32 = 15_000;
+    const SPAN: u32 = 15_000;
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    // Ponto de partida diferente a cada execução, para não repetir as portas da anterior.
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id().wrapping_mul(7919) % SPAN,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    let n32 = u32::from(n);
+    loop {
+        let first = BASE + NEXT.fetch_add(n32, Ordering::SeqCst) % (SPAN - n32);
+        let all_free = (first..first + n32).all(|p| {
+            let p = p as u16;
+            std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+                && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+        });
+        if all_free {
+            return first as u16;
+        }
+    }
 }
 
 /// Comando de um binário do projeto, com ambiente limpo de HBT_* herdados.
@@ -95,7 +124,12 @@ impl Fixture {
             dir,
             control,
             fingerprint,
-            _server: spawn_quiet(c),
+            _server: {
+                // O log do servidor vai para um arquivo: se ele morrer na partida, o teste mostra por quê.
+                let log = std::fs::File::create(std::env::temp_dir().join(format!("hbt-e2e-{control}.log")))
+                    .unwrap();
+                c.stdout(Stdio::null()).stderr(log).spawn().unwrap()
+            },
         }
     }
 
@@ -459,7 +493,9 @@ impl Fixture {
             }
             sleep(Duration::from_millis(100)).await;
         }
-        panic!("o site não subiu");
+        let log = std::fs::read_to_string(std::env::temp_dir().join(format!("hbt-e2e-{}.log", fx.control)))
+            .unwrap_or_default();
+        panic!("o site não subiu em 10 s. Log do servidor:\n{log}");
     }
 
     /// `hbt-server <args...>` (sem o prefixo `token`), como o admin faria.

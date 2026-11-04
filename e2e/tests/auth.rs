@@ -40,8 +40,8 @@ async fn unknown_token_id_is_rejected_like_a_wrong_secret() {
 
 #[tokio::test]
 async fn token_port_acl_is_enforced() {
-    let base = free_port();
-    let (ok_port, bad_port) = (base, base.saturating_add(1));
+    let base = free_ports(2);
+    let (ok_port, bad_port) = (base, base + 1);
     // Servidor permite as duas; o TOKEN só permite a primeira.
     let fx = Fixture::start(&format!("{ok_port}-{bad_port}"), &[]);
     let token = fx.token("restrito", &["--ports", &format!("{ok_port}-{ok_port}")]);
