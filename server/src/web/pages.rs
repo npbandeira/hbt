@@ -46,6 +46,10 @@ fn shell(title: &str, nav: Nav<'_>, body: &Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 title { (title) " · HBT" }
+                link rel="icon" href=(assets::url("favicon.ico")) sizes="48x48";
+                link rel="icon" href=(assets::url("favicon.svg")) type="image/svg+xml";
+                link rel="apple-touch-icon" href=(assets::url("apple-touch-icon.png"));
+                meta name="theme-color" content="#cbe4f2";
                 link rel="stylesheet" href=(assets::url("app.css"));
                 // Sem defer de propósito: marca html.js antes da primeira pintura (as
                 // entradas só escondem o conteúdo quando há JavaScript para mostrá-lo).

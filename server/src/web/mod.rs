@@ -49,6 +49,7 @@ pub async fn serve(listener: TcpListener, web: Arc<Web>) {
         .route("/tokens", post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
         .route("/assets/{file}", get(assets::serve))
+        .route("/favicon.ico", get(assets::favicon))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(security_headers))
         .with_state(web);
