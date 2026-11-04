@@ -22,7 +22,14 @@ fn version() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in CSS.iter().chain(JS).chain(HTMX).chain(FAVICON_SVG).chain(FAVICON_ICO).chain(TOUCH_ICON) {
+        for b in CSS
+            .iter()
+            .chain(JS)
+            .chain(HTMX)
+            .chain(FAVICON_SVG)
+            .chain(FAVICON_ICO)
+            .chain(TOUCH_ICON)
+        {
             h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
         }
         format!("{h:016x}")
