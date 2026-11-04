@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-03
+
+Só o `hbt-server` mudou: protocolo e banco iguais aos da 2.1.0.
+
 ### Corrigido
 
 - Ao sair do `--acme-staging`, o servidor continuava servindo o certificado de teste por até 60 dias. Agora pede um novo na hora quando o certificado em uso é do outro ambiente (staging x produção) ou não cobre `<domínio>` e `*.<domínio>` (domínio trocado).
@@ -138,7 +142,8 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/npbandeira/hbt/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/npbandeira/hbt/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/npbandeira/hbt/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/npbandeira/hbt/compare/v2.0.1...v2.0.2
