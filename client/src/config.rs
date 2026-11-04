@@ -1,6 +1,5 @@
-//! Configuração persistente do cliente (servidor + token + fingerprint), como o
-//! `ngrok config add-authtoken`: você configura uma vez e depois só digita
-//! `hbt http 3000`.
+//! Configuração persistente do cliente (servidor + token + fingerprint): você
+//! configura uma vez com `hbt configure` e depois só digita `hbt http 3000`.
 //!
 //! Prioridade de resolução: flag na linha de comando > variável de ambiente >
 //! arquivo. (clap já resolve flag e env; aqui entra o arquivo como "último

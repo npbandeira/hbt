@@ -7,7 +7,7 @@ use hbt_proto::*;
 use crate::config;
 
 #[derive(Parser)]
-#[command(version, about = "hbt reverse tunnel client (estilo ngrok)")]
+#[command(version, about = "hbt reverse tunnel client")]
 pub struct Cli {
     /// Servidor hbt, ex: tunnel.exemplo.com ou 1.2.3.4:7000 (porta padrão 7000).
     /// Se omitido, usa o valor salvo por `hbt configure`.

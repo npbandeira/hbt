@@ -83,7 +83,7 @@ pub enum UserCmd {
 /// Quem pode criar conta no site.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Signup {
-    /// Qualquer pessoa (estilo ngrok); o abuso é limitado por cotas e pelo `user disable`.
+    /// Qualquer pessoa; o abuso é limitado por cotas e pelo `user disable`.
     Open,
     /// Só contas criadas pelo admin com `hbt-server user add`.
     Closed,
