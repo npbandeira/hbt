@@ -5,6 +5,10 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-03
+
+Protocolo igual ao da 2.0.x: clientes 2.0 continuam funcionando, basta atualizar o `hbt-server`. O banco ganha a tabela de reservas sozinho na primeira abertura.
+
 ### Adicionado
 
 - **HTTPS próprio** (`--https-bind 0.0.0.0:443`): o servidor termina o TLS. Túneis em `https://<sub>.<domínio>`, o site em `https://<domínio>` (com HSTS) e a porta 80 redirecionando para https (308). Dispensa Caddy/nginx na frente.
@@ -129,7 +133,8 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/npbandeira/hbt/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/npbandeira/hbt/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/npbandeira/hbt/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/npbandeira/hbt/compare/v2.0.0...v2.0.1
