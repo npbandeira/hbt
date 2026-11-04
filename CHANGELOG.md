@@ -5,6 +5,14 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-11-03
+
+Só a interface do site mudou: protocolo e banco iguais aos da 2.0.x, basta atualizar o `hbt-server`.
+
+### Adicionado
+
+- **Favicon**: o disco magenta da marca, em SVG, ICO (16/32/48, também servido em `/favicon.ico`) e um `apple-touch-icon` de 180 px sobre o fundo céu. Embutidos no binário.
+
 ## [2.0.2] - 2026-11-03
 
 Protocolo e banco iguais aos da 2.0.x: basta atualizar o `hbt-server`.
@@ -113,7 +121,8 @@ Primeira versão: túnel reverso (TCP, UDP e HTTP) em Rust, no estilo do ngrok.
 - UDP passava dentro de TCP: sob perda de pacotes a latência sobe.
 - Até 1024 conexões simultâneas por túnel.
 
-[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/npbandeira/hbt/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/npbandeira/hbt/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/npbandeira/hbt/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/npbandeira/hbt/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/npbandeira/hbt/compare/v0.1.1...v2.0.0
