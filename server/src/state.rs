@@ -9,6 +9,7 @@ use hbt_proto::mux::Opener;
 
 use crate::db::Store;
 use crate::metrics::Metrics;
+use crate::tls::CertStore;
 
 /// Estado compartilhado entre todos os tasks.
 ///
@@ -85,6 +86,35 @@ pub struct HttpCfg {
     pub domain: String,
     /// Porta pública do edge, só para montar a URL mostrada ao usuário.
     pub port: u16,
+    /// HTTPS no edge (None = só http).
+    pub https: Option<HttpsCfg>,
+}
+
+pub struct HttpsCfg {
+    /// Porta pública do HTTPS (443 em produção), para a URL e o redirecionamento.
+    pub port: u16,
+    pub certs: Arc<CertStore>,
+}
+
+impl HttpCfg {
+    /// Porta do HTTPS quando já há certificado para servir.
+    pub fn https_port(&self) -> Option<u16> {
+        self.https.as_ref().filter(|h| h.certs.ready()).map(|h| h.port)
+    }
+
+    /// URL pública de um subdomínio: https assim que houver certificado.
+    pub fn url(&self, sub: &str) -> String {
+        let (scheme, port, default) = match self.https_port() {
+            Some(p) => ("https", p, 443),
+            None => ("http", self.port, 80),
+        };
+        let port = if port == default {
+            String::new()
+        } else {
+            format!(":{port}")
+        };
+        format!("{scheme}://{sub}.{}{port}", self.domain)
+    }
 }
 
 /// Remove a rota HTTP quando o túnel acaba (RAII, como `AbortOnDrop`).

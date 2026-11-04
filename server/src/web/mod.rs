@@ -1,8 +1,9 @@
 //! O site do hbt: landing, cadastro, login e painel de tokens.
 //!
 //! HTML gerado no servidor (maud, que escapa tudo por padrão) e trocado em
-//! pedaços pelo htmx. Quem põe HTTPS na frente é o proxy (Caddy/nginx): o site
-//! só fala HTTP em `--web-bind` e confia em `X-Forwarded-*` quando o par é local.
+//! pedaços pelo htmx. Em `--web-bind` o site fala HTTP e confia em
+//! `X-Forwarded-*` quando o par é local (proxy na frente); com `--https-bind`
+//! ele também responde no domínio raiz da porta 443, com o TLS do próprio hbt.
 
 mod assets;
 mod auth;
@@ -39,8 +40,10 @@ pub struct WebCfg {
     pub fingerprint: String,
 }
 
-pub async fn serve(listener: TcpListener, web: Arc<Web>) {
-    let app = Router::new()
+/// As rotas do site, prontas para servir por `serve` (HTTP em `--web-bind`) ou
+/// por `serve_conn` (cada conexão TLS do domínio raiz na porta 443).
+pub fn router(web: Arc<Web>) -> Router {
+    Router::new()
         .route("/", get(landing))
         .route("/signup", get(signup_page).post(signup))
         .route("/login", get(login_page).post(login))
@@ -52,9 +55,40 @@ pub async fn serve(listener: TcpListener, web: Arc<Web>) {
         .route("/favicon.ico", get(assets::favicon))
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(middleware::from_fn(security_headers))
-        .with_state(web);
+        .with_state(web)
+}
+
+pub async fn serve(listener: TcpListener, app: Router) {
     if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
         tracing::warn!("site encerrou: {e}");
+    }
+}
+
+/// Serve o site numa conexão já com TLS. O IP de quem conectou vai como
+/// `ConnectInfo` (o par é o usuário de verdade, sem proxy no meio) e toda
+/// resposta leva HSTS: o navegador passa a usar só https neste domínio.
+pub async fn serve_conn<IO>(io: IO, peer: SocketAddr, app: Router)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let app = app
+        .layer(axum::Extension(ConnectInfo(peer)))
+        .layer(middleware::map_response(|mut r: Response| async move {
+            r.headers_mut().insert(
+                header::STRICT_TRANSPORT_SECURITY,
+                HeaderValue::from_static("max-age=31536000"),
+            );
+            r
+        }));
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(10))
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(io),
+            hyper_util::service::TowerToHyperService::new(app),
+        );
+    if let Err(e) = conn.await {
+        tracing::debug!("site {peer}: {e}");
     }
 }
 

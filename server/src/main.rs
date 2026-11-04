@@ -24,6 +24,7 @@ mod identity;
 mod metrics;
 mod serve;
 mod state;
+mod tls;
 mod tokens;
 mod tunnel;
 mod web;
@@ -52,7 +53,13 @@ async fn main() -> Result<()> {
         }
         Command::Serve(args) => {
             let store = Store::open(&cli.data_dir)?;
-            serve::serve(args, store, identity::load_or_create(&cli.data_dir)?).await
+            serve::serve(
+                *args,
+                store,
+                identity::load_or_create(&cli.data_dir)?,
+                &cli.data_dir,
+            )
+            .await
         }
     }
 }

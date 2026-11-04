@@ -229,12 +229,7 @@ fn register_http(
     routes.insert(sub.clone(), opener.clone());
     drop(routes);
 
-    let port = if cfg.port == 80 {
-        String::new()
-    } else {
-        format!(":{}", cfg.port)
-    };
-    let url = format!("http://{sub}.{}{port}", cfg.domain);
+    let url = cfg.url(&sub);
     let guard = RouteGuard {
         state: state.clone(),
         subdomain: sub,

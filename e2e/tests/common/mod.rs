@@ -47,6 +47,8 @@ pub fn cmd(bin: &str) -> Command {
         .env_remove("HBT_FINGERPRINT")
         .env_remove("HBT_DOMAIN")
         .env_remove("HBT_DATA_DIR")
+        .env_remove("HBT_HTTPS_BIND")
+        .env_remove("HBT_DUCKDNS_TOKEN")
         .kill_on_drop(true); // sem isso, falha de teste deixaria processos órfãos
     c
 }
@@ -67,6 +69,11 @@ pub struct Fixture {
 impl Fixture {
     /// `range` = faixa pública de portas; `extra` = flags extras do `serve`.
     pub fn start(range: &str, extra: &[&str]) -> Fixture {
+        Fixture::start_prepared(range, extra, |_| {})
+    }
+
+    /// Como `start`, mas roda `prep(data_dir)` antes de subir o `serve`.
+    pub fn start_prepared(range: &str, extra: &[&str], prep: impl FnOnce(&Path)) -> Fixture {
         let control = free_port();
         let dir = std::env::temp_dir().join(format!("hbt-e2e-{}-{control}", std::process::id()));
         // Gera o certificado antes do `serve`, para já termos o fingerprint.
@@ -78,6 +85,7 @@ impl Fixture {
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let fingerprint = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        prep(&dir);
         let mut c = cmd("hbt-server");
         c.args(["--data-dir"]).arg(&dir);
         c.args(["serve", "--control-bind", &format!("127.0.0.1:{control}")]);

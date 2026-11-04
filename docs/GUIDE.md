@@ -223,10 +223,21 @@ replay de requisições como o painel do ngrok, e uma conexão que misture
 (hyper) resolve isso a custo de bem mais código.
 
 **HTTPS**
-O edge fala HTTP puro. Terminar TLS aqui exigiria certificados wildcard
-(ACME DNS-01) e `rustls`: ótimo exercício futuro. Hoje a recomendação é
-deixar Caddy/nginx com o certificado na frente: separa responsabilidades e
-usa software maduro para renovar certificados.
+Com `--https-bind`, o edge termina o TLS (`rustls` via `tokio-rustls`) com um
+certificado que cobre `<domínio>` e `*.<domínio>`. Depois do handshake, o SNI
+decide: o domínio raiz vai para o site (servido pelo hyper na própria conexão,
+com HSTS), qualquer outro nome vira o mesmo "cano" do edge HTTP, e o serviço local
+recebe HTTP puro. ALPN anuncia só `http/1.1`, porque o cano é de HTTP/1.x.
+
+O certificado vem do Let's Encrypt por ACME (`instant-acme`) com desafio DNS-01:
+é o único que emite wildcard, e um certificado por subdomínio esbarraria no limite
+de 50 por semana com cadastro aberto. O registro TXT é gravado pela API do DuckDNS,
+que guarda um TXT só por domínio, enquanto o domínio e o wildcard pedem dois valores
+no mesmo nome. Por isso as duas autorizações são validadas uma depois da outra.
+A renovação começa no último terço da validade e o certificado novo é trocado
+em memória (`ResolvesServerCert`), sem derrubar conexões. Sem certificado, a porta 80
+continua servindo os túneis em http; com ele, só redireciona (308) para https,
+e apenas para nomes do próprio domínio.
 
 **Subdomínios**
 Sorteados (32 bits aleatórios) ou pedidos pelo cliente, validados como label DNS.

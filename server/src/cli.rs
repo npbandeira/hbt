@@ -26,7 +26,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Roda o servidor.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Gerencia as contas do site (e-mail e senha; valem imediatamente).
     User {
         #[command(subcommand)]
@@ -109,10 +109,31 @@ pub struct ServeArgs {
     pub domain: Option<String>,
 
     /// Onde escutar requisições HTTP públicas (usado com --domain). A porta 80
-    /// exige root ou `setcap cap_net_bind_service=+ep`. Para HTTPS, ponha um
-    /// proxy com TLS (Caddy/nginx) na frente e use p.ex. 127.0.0.1:8080.
+    /// exige root ou `setcap cap_net_bind_service=+ep`. Com --https-bind e o
+    /// certificado pronto, ela só redireciona para https.
     #[arg(long, env = "HBT_HTTP_BIND", default_value = "0.0.0.0:80")]
     pub http_bind: String,
+
+    /// Onde escutar HTTPS público, ex: 0.0.0.0:443 (usado com --domain). O
+    /// certificado cobre `<domain>` (o site, se --web-bind estiver ligado) e
+    /// `*.<domain>` (os túneis); fica em `<data-dir>/tls/{cert,key}.pem`.
+    #[arg(long, env = "HBT_HTTPS_BIND")]
+    pub https_bind: Option<String>,
+
+    /// Token do DuckDNS: com ele o servidor emite e renova sozinho o
+    /// certificado no Let's Encrypt (o --domain precisa ser `<nome>.duckdns.org`).
+    /// Sem ele, ponha o certificado em `<data-dir>/tls/` por fora.
+    #[arg(long, env = "HBT_DUCKDNS_TOKEN", hide_env_values = true)]
+    pub duckdns_token: Option<String>,
+
+    /// E-mail de contato da conta no Let's Encrypt (avisos de expiração). Opcional.
+    #[arg(long, env = "HBT_ACME_EMAIL")]
+    pub acme_email: Option<String>,
+
+    /// Usa o ambiente de testes do Let's Encrypt (certificado não confiável,
+    /// limites folgados). Para experimentar a configuração sem gastar a cota.
+    #[arg(long, env = "HBT_ACME_STAGING")]
+    pub acme_staging: bool,
 
     /// Onde servir métricas Prometheus (`GET /metrics`), ex: 127.0.0.1:9477.
     /// Sem isso, desligado. Não há autenticação: não exponha à internet.
@@ -121,7 +142,8 @@ pub struct ServeArgs {
 
     /// Onde servir o site (landing, cadastro, painel de tokens), ex:
     /// 127.0.0.1:8081. Sem isso, o site fica desligado. Ele tem senha e token:
-    /// ponha um proxy com HTTPS (Caddy/nginx) na frente.
+    /// sirva-o por HTTPS, com --https-bind (aparece no domínio raiz) ou com um
+    /// proxy (Caddy/nginx) na frente.
     #[arg(long, env = "HBT_WEB_BIND")]
     pub web_bind: Option<String>,
 

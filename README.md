@@ -91,14 +91,9 @@ hbt-server user list                      # contas e quantos tokens cada uma tem
 hbt-server user disable ana@exemplo.com   # bloqueia e revoga TODOS os tokens dela
 ```
 
-- **O site precisa de HTTPS** (tem senha e token). Sem domínio próprio, um nome grátis
-  do [DuckDNS](https://www.duckdns.org) (`meuhbt.duckdns.org` apontando para o IP do
-  VPS) serve; o Caddy emite o certificado sozinho. `Caddyfile`:
-  ```
-  meuhbt.duckdns.org {
-      reverse_proxy 127.0.0.1:8081
-  }
-  ```
+- **O site precisa de HTTPS** (tem senha e token). Com `--https-bind` (veja **HTTPS**
+  abaixo) ele aparece em `https://<domínio>` sem proxy nenhum. Sem isso, ponha
+  Caddy/nginx com HTTPS na frente de `--web-bind`.
 - `--signup closed` fecha o cadastro: só entram contas criadas por
   `hbt-server user add <e-mail>` (a senha é gerada e mostrada uma vez). O padrão,
   `open`, é como o ngrok; o abuso é limitado por `--max-tokens-per-user` (padrão 5),
@@ -132,8 +127,24 @@ O cliente guarda servidor, token e fingerprint em `~/.config/hbt/config.toml`
 `--fingerprint`) > variável (`HBT_SERVER`, `HBT_TOKEN`, `HBT_FINGERPRINT`) > arquivo. `hbt configure` sem argumentos mostra a
 configuração atual. Para ver logs: `RUST_LOG=info hbt http 3000`.
 
-**HTTPS**: o servidor fala HTTP puro; ponha Caddy/nginx com certificado
-wildcard na frente (`HBT_HTTP_BIND=127.0.0.1:8080`) e repasse para ele.
+**HTTPS**: com `--https-bind 0.0.0.0:443`, o próprio servidor termina o TLS.
+Os túneis ficam em `https://<sub>.<domínio>`, o site (se `--web-bind` estiver
+ligado) em `https://<domínio>`, e a porta 80 passa a redirecionar para https. O
+certificado cobre `<domínio>` e `*.<domínio>` e fica em `<data-dir>/tls/`:
+
+```sh
+# Domínio grátis do DuckDNS (meuhbt.duckdns.org apontando para o IP do VPS):
+# o servidor emite e renova o certificado sozinho no Let's Encrypt (DNS-01).
+HBT_DUCKDNS_TOKEN=... hbt-server serve --domain meuhbt.duckdns.org \
+  --https-bind 0.0.0.0:443 --web-bind 127.0.0.1:8081
+```
+
+O DuckDNS já resolve qualquer `*.meuhbt.duckdns.org` para o mesmo IP, então não
+há DNS wildcard a criar. Em outro provedor de DNS, gere o certificado por fora
+(p.ex. certbot) e copie `cert.pem` e `key.pem` para `<data-dir>/tls/`: o servidor
+relê os arquivos de hora em hora. Para testar a configuração sem gastar a cota do
+Let's Encrypt, use `--acme-staging` (o certificado sai, mas não é confiável).
+Enquanto não há certificado, tudo segue em http.
 
 **Testar tudo na própria máquina**, sem VPS nem DNS: `./scripts/demo-local.sh`
 roda tudo automaticamente. Na mão:

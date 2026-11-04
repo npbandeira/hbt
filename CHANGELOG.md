@@ -5,6 +5,12 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+### Adicionado
+
+- **HTTPS próprio** (`--https-bind 0.0.0.0:443`): o servidor termina o TLS. Túneis em `https://<sub>.<domínio>`, o site em `https://<domínio>` (com HSTS) e a porta 80 redirecionando para https (308). Dispensa Caddy/nginx na frente.
+- **Certificado automático com DuckDNS** (`--duckdns-token`): emite e renova no Let's Encrypt um certificado para `<domínio>` e `*.<domínio>` (ACME DNS-01), trocado sem reiniciar. `--acme-email` e `--acme-staging` opcionais. Sem o token, o servidor usa `cert.pem`/`key.pem` de `<data-dir>/tls/` e os relê de hora em hora.
+- `install-server.sh` aceita `--https-bind`, `--duckdns-token` e `--acme-email`; o `server.env` passa a ser legível só pelo root.
+
 ## [2.0.3] - 2026-11-03
 
 Só a interface do site mudou: protocolo e banco iguais aos da 2.0.x, basta atualizar o `hbt-server`.

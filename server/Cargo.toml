@@ -20,6 +20,16 @@ maud = { version = "0.27.0", features = ["axum"] }
 argon2 = "0.6.0"
 thiserror.workspace = true
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio", "service", "server"] }
+x509-parser = "0.18.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "native-tokio", "tls12", "logging"] }
+http-body-util = "0.1.5"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"

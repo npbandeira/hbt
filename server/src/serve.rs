@@ -1,6 +1,7 @@
 //! Inicialização do servidor: listeners e loop de aceitação da porta de controle.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -11,25 +12,45 @@ use tracing::{debug, info, warn};
 use crate::cli::{ServeArgs, Signup};
 use crate::control::handle_conn;
 use crate::db::Store;
-use crate::http_edge::http_edge;
+use crate::http_edge::{http_edge, https_edge};
 use crate::identity::Identity;
 use crate::metrics;
-use crate::state::{HttpCfg, State};
+use crate::state::{HttpCfg, HttpsCfg, State};
+use crate::tls::{self, Acme, CertStore};
 use crate::web::{self, WebCfg};
 
-pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<()> {
-    let http_listener = match args.domain {
-        Some(_) => Some(
-            TcpListener::bind(&args.http_bind)
-                .await
-                .with_context(|| format!("não consegui abrir {}", args.http_bind))?,
-        ),
+pub async fn serve(args: ServeArgs, store: Store, identity: Identity, data_dir: &Path) -> Result<()> {
+    let domain = args.domain.as_ref().map(|d| d.to_ascii_lowercase());
+    if domain.is_none() && (args.https_bind.is_some() || args.duckdns_token.is_some()) {
+        bail!("--https-bind e --duckdns-token precisam de --domain");
+    }
+    if args.duckdns_token.is_some() && args.https_bind.is_none() {
+        bail!("--duckdns-token emite o certificado do HTTPS: use junto com --https-bind 0.0.0.0:443");
+    }
+    if let (Some(d), Some(_)) = (&domain, &args.duckdns_token) {
+        tls::duckdns_name(d)?;
+    }
+
+    let http_listener = match domain {
+        Some(_) => Some(bind(&args.http_bind).await?),
         None => None,
     };
-    let http = match (&args.domain, &http_listener) {
-        (Some(domain), Some(l)) => Some(HttpCfg {
-            domain: domain.to_ascii_lowercase(),
+    let https_listener = match &args.https_bind {
+        Some(b) => Some(bind(b).await?),
+        None => None,
+    };
+    let https = match &https_listener {
+        Some(l) => Some(HttpsCfg {
             port: l.local_addr()?.port(),
+            certs: CertStore::open(data_dir)?,
+        }),
+        None => None,
+    };
+    let http = match (&domain, &http_listener) {
+        (Some(domain), Some(l)) => Some(HttpCfg {
+            domain: domain.clone(),
+            port: l.local_addr()?.port(),
+            https,
         }),
         _ => None,
     };
@@ -76,6 +97,7 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<
         tokio::spawn(metrics::serve(l, state.metrics.clone()));
     }
 
+    let mut site = None;
     if let Some(bind) = &args.web_bind {
         let l = TcpListener::bind(bind)
             .await
@@ -89,17 +111,29 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<
             },
             args.max_tokens_per_user
         );
+        // Com HTTPS próprio, o site mora em https://<domínio>.
+        let url = args.web_url.clone().or_else(|| {
+            let h = state.http.as_ref()?;
+            let port = h.https.as_ref()?.port;
+            Some(if port == 443 {
+                format!("https://{}", h.domain)
+            } else {
+                format!("https://{}:{port}", h.domain)
+            })
+        });
         let web = web::new(
             state.clone(),
             WebCfg {
-                url: args.web_url.clone(),
+                url,
                 signup_open: args.signup == Signup::Open,
                 max_tokens: args.max_tokens_per_user,
                 control_port: control_addr.port(),
                 fingerprint: identity.fingerprint(),
             },
         );
-        tokio::spawn(web::serve(l, web));
+        let app = web::router(web);
+        site = Some(app.clone());
+        tokio::spawn(web::serve(l, app));
     }
 
     if let Some(l) = http_listener {
@@ -109,6 +143,29 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<
             state.http.as_ref().unwrap().domain
         );
         tokio::spawn(http_edge(l, state.clone()));
+    }
+
+    if let (Some(l), Some(h)) = (https_listener, state.http.as_ref()) {
+        let certs = h.https.as_ref().unwrap().certs.clone();
+        info!(
+            "HTTPS em {} | {} e *.{} | certificado {}",
+            args.https_bind.as_deref().unwrap_or_default(),
+            h.domain,
+            h.domain,
+            match (&args.duckdns_token, certs.ready()) {
+                (_, true) => "carregado",
+                (Some(_), false) => "sendo emitido (DuckDNS + Let's Encrypt)",
+                (None, false) => "ausente: ponha cert.pem e key.pem em <data-dir>/tls/",
+            }
+        );
+        let acme = args.duckdns_token.clone().map(|token| Acme {
+            domain: h.domain.clone(),
+            duckdns_token: token,
+            email: args.acme_email.clone(),
+            staging: args.acme_staging,
+        });
+        tokio::spawn(tls::keep_fresh(certs, acme));
+        tokio::spawn(https_edge(l, state.clone(), site));
     }
 
     while let Some(incoming) = endpoint.accept().await {
@@ -121,4 +178,10 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity) -> Result<
         });
     }
     Ok(())
+}
+
+async fn bind(addr: &str) -> Result<TcpListener> {
+    TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("não consegui abrir {addr}"))
 }
