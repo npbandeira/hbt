@@ -163,6 +163,14 @@ pub struct ServeArgs {
     /// Túneis simultâneos por token (cada um ocupa uma porta pública).
     #[arg(long, env = "HBT_MAX_TUNNELS_PER_TOKEN", default_value_t = 2)]
     pub max_tunnels_per_token: usize,
+
+    /// Quantos subdomínios cada conta do site pode reservar (0 desliga as reservas).
+    #[arg(long, env = "HBT_MAX_RESERVED_PER_USER", default_value_t = 3)]
+    pub max_reserved_per_user: usize,
+
+    /// Dias sem túnel aberto até uma reserva de subdomínio ser liberada.
+    #[arg(long, env = "HBT_RESERVATION_DAYS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub reservation_days: u64,
 }
 
 fn parse_range(s: &str) -> Result<RangeInclusive<u16>, String> {

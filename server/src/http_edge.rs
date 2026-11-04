@@ -125,7 +125,8 @@ where
         }
     }
 
-    let route = subdomain_of(&state, &host).and_then(|sub| state.routes.lock().unwrap().get(&sub).cloned());
+    let route = subdomain_of(&state, &host)
+        .and_then(|sub| state.routes.lock().unwrap().get(&sub).map(|r| r.opener.clone()));
     let Some(route) = route else {
         state.metrics.conn_error(ConnError::NoRoute);
         respond(

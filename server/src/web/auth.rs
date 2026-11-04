@@ -141,6 +141,33 @@ impl Web {
         format!("{host}:{}", self.cfg.control_port)
     }
 
+    /// Reservas de subdomínio ligadas: precisa de túneis HTTP e de cota > 0.
+    pub fn reservations_on(&self) -> bool {
+        self.state.http.is_some() && self.cfg.max_reserved > 0
+    }
+
+    /// O que o painel mostra de uma reserva.
+    pub fn reservation_view(&self, r: &crate::db::Reservation) -> super::pages::ReservationView {
+        let active = self
+            .state
+            .routes
+            .lock()
+            .unwrap()
+            .get(&r.name)
+            .is_some_and(|route| route.owner.as_deref() == Some(r.owner.as_str()));
+        super::pages::ReservationView {
+            url: self
+                .state
+                .http
+                .as_ref()
+                .map(|h| h.url(&r.name))
+                .unwrap_or_default(),
+            name: r.name.clone(),
+            active,
+            expires: r.last_used + self.cfg.reservation_days * 24 * 60 * 60,
+        }
+    }
+
     fn secure_attr(&self, headers: &HeaderMap) -> &'static str {
         let https = headers.get("x-forwarded-proto").is_some_and(|v| v == "https")
             || self.cfg.url.as_deref().is_some_and(|u| u.starts_with("https://"));

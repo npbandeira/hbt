@@ -25,6 +25,41 @@ pub fn quota(max: usize) -> String {
     format!("Você já tem {max} tokens. Revogue um para criar outro.")
 }
 
+pub const BAD_SUBDOMAIN: &str =
+    "Use de 1 a 63 caracteres: letras minúsculas, números e hífen (não nas pontas).";
+
+pub fn banned(name: &str) -> String {
+    format!("\"{name}\" é um nome do servidor e não pode ser reservado. Escolha outro.")
+}
+
+pub fn in_use(name: &str) -> String {
+    format!("\"{name}\" está em uso por outro túnel agora. Escolha outro ou tente mais tarde.")
+}
+
+pub fn taken(name: &str) -> String {
+    format!("\"{name}\" já é de outra conta. Escolha outro.")
+}
+
+pub fn reservation_quota(max: usize) -> String {
+    format!("Você já reservou {max} subdomínios. Libere um para reservar outro.")
+}
+
+/// Uma reserva como o painel mostra.
+pub struct ReservationView {
+    pub name: String,
+    pub url: String,
+    /// Há um túnel da conta aberto com este nome agora.
+    pub active: bool,
+    /// Quando a reserva cai se nenhum túnel usar o nome até lá.
+    pub expires: u64,
+}
+
+pub struct Reservations {
+    pub rows: Vec<ReservationView>,
+    pub max: usize,
+    pub days: u64,
+}
+
 /// O htmx só troca o conteúdo de respostas 2xx/3xx por padrão; os erros de
 /// formulário voltam como 422 e precisam ser trocados também.
 const HTMX_CONFIG: &str = r#"{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true},{"code":"[45]..","swap":false,"error":true}]}"#;
@@ -374,7 +409,12 @@ pub fn signup(open: bool, error: Option<&str>, email: &str) -> Markup {
 
 // ---------------------------------------------------------------- painel
 
-pub fn dashboard(email: &str, tokens: &[TokenRecord], online: &[bool]) -> Markup {
+pub fn dashboard(
+    email: &str,
+    tokens: &[TokenRecord],
+    online: &[bool],
+    reservations: Option<&Reservations>,
+) -> Markup {
     let connected = online.iter().filter(|o| **o).count();
     shell(
         "Painel",
@@ -411,10 +451,82 @@ pub fn dashboard(email: &str, tokens: &[TokenRecord], online: &[bool]) -> Markup
                         p class="mt-4 font-semibold" { "2. Cole o comando do token" }
                         p class="mt-1" { "Ele aparece ao criar o token. Depois é só abrir o túnel, por exemplo " code { "hbt http 3000" } "." }
                     }
+                    @if let Some(res) = reservations {
+                        (reservations_section(res))
+                    }
                 }
             }
         },
     )
+}
+
+fn reservations_section(res: &Reservations) -> Markup {
+    html! {
+        section class="lg:col-start-1 lg:row-start-3" aria-labelledby="res-title" {
+            h2 id="res-title" class="font-sans text-lead font-semibold tracking-normal leading-tight" { "Subdomínios reservados" }
+            p class="mt-2 max-w-[60ch]" {
+                "Um nome reservado é só seu: o endereço não muda entre um túnel e outro. Até " (res.max)
+                " por conta; a reserva cai depois de " (res.days) " dias sem nenhum túnel usando o nome. Abra com "
+                code { "hbt http 3000 --subdomain <nome>" } "."
+            }
+            ul id="res-rows" class="mt-4" {
+                @for r in &res.rows { (reservation_row(r)) }
+            }
+            @if res.rows.is_empty() {
+                p id="res-empty" class="rounded-2xl bg-surface px-5 py-6" { "Nenhum subdomínio reservado ainda." }
+            }
+            (reserve_form(false))
+            div id="res-error" class="mt-3" aria-live="polite" {}
+        }
+    }
+}
+
+fn reserve_form(oob: bool) -> Markup {
+    html! {
+        form id="reserve-form" hx-post="/reservations" hx-target="#res-error" hx-swap="innerHTML"
+            hx-swap-oob=[oob.then_some("true")] class="mt-6 flex flex-wrap items-end gap-3" {
+            label class="grid gap-1" {
+                span class="font-semibold" { "Nome" }
+                input class="field max-w-64" type="text" name="name" required maxlength="63" pattern="[a-z0-9-]+"
+                    placeholder="meu-app" autocomplete="off" autocapitalize="none" spellcheck="false";
+            }
+            button type="submit" class="btn" { "Reservar" }
+        }
+    }
+}
+
+fn reservation_row(r: &ReservationView) -> Markup {
+    let dom = format!("res-{}", r.name);
+    html! {
+        li id=(dom) class="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-1 border-b border-ink/15 py-4 sm:grid-cols-[minmax(0,1fr)_9rem_auto]" {
+            span class="min-w-0" {
+                span class="block truncate text-lead font-semibold" { (r.name) }
+                span class="block truncate text-sm text-muted" { (r.url) }
+            }
+            span class="flex items-center gap-2" {
+                span class=(if r.active { "dot dot-on" } else { "dot" }) aria-hidden="true" {}
+                @if r.active { "Em uso" } @else {
+                    span {
+                        span class="block" { "Reservado" }
+                        span class="block whitespace-nowrap text-sm text-muted" { "até " (format_date(r.expires)) }
+                    }
+                }
+            }
+            button type="button" class="btn btn-quiet justify-self-start !px-0 sm:justify-self-end sm:!px-3" hx-delete=(format!("/reservations/{}", r.name))
+                hx-target=(format!("#{dom}")) hx-swap="outerHTML"
+                hx-confirm=(format!("Liberar \"{}\"? Qualquer pessoa poderá usar o nome depois disso.", r.name)) {
+                "Liberar"
+            }
+        }
+    }
+}
+
+pub fn reservation_created(r: &ReservationView) -> Markup {
+    html! {
+        ul id="res-rows" hx-swap-oob="beforeend" { (reservation_row(r)) }
+        p id="res-empty" hx-swap-oob="delete" {}
+        (reserve_form(true))
+    }
 }
 
 fn create_form(oob: bool) -> Markup {
@@ -487,7 +599,7 @@ mod tests {
             subdomains: None,
             owner: None,
         };
-        let html = dashboard("<b>e@x.com</b>", std::slice::from_ref(&rec), &[false]).into_string();
+        let html = dashboard("<b>e@x.com</b>", std::slice::from_ref(&rec), &[false], None).into_string();
         assert!(!html.contains("<script>alert"), "nome do token escapado");
         assert!(!html.contains("<b>e@x.com"), "e-mail escapado");
         assert!(html.contains("&lt;script&gt;"));
@@ -531,7 +643,22 @@ mod tests {
             landing(false),
             login(None, ""),
             signup(true, None, ""),
-            dashboard("a@b.co", &[], &[]),
+            dashboard("a@b.co", &[], &[], None),
+            dashboard(
+                "a@b.co",
+                &[],
+                &[],
+                Some(&Reservations {
+                    rows: vec![ReservationView {
+                        name: "ana".into(),
+                        url: "https://ana.x.duckdns.org".into(),
+                        active: true,
+                        expires: 0,
+                    }],
+                    max: 3,
+                    days: 30,
+                }),
+            ),
         ] {
             let html = page.into_string();
             assert!(!html.contains("<style"), "estilo inline");

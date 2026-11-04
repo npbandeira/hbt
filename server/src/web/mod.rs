@@ -35,6 +35,10 @@ pub struct WebCfg {
     pub url: Option<String>,
     pub signup_open: bool,
     pub max_tokens: usize,
+    /// Subdomínios reservados por conta (0 = reservas desligadas).
+    pub max_reserved: usize,
+    /// Dias sem uso até a reserva ser liberada.
+    pub reservation_days: u64,
     /// Porta do QUIC (controle), para o comando de configuração.
     pub control_port: u16,
     pub fingerprint: String,
@@ -51,6 +55,8 @@ pub fn router(web: Arc<Web>) -> Router {
         .route("/dashboard", get(dashboard))
         .route("/tokens", post(create_token))
         .route("/tokens/{id}", delete(revoke_token))
+        .route("/reservations", post(reserve))
+        .route("/reservations/{name}", delete(release))
         .route("/assets/{file}", get(assets::serve))
         .route("/favicon.ico", get(assets::favicon))
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -252,7 +258,92 @@ async fn dashboard(State(web): State<Arc<Web>>, headers: HeaderMap) -> Response 
         .await
         .unwrap_or_default();
     let online: Vec<bool> = tokens.iter().map(|t| web.state.is_online(&t.id)).collect();
-    pages::dashboard(&user.email, &tokens, &online).into_response()
+    let reservations = if web.reservations_on() {
+        let owner = user.id.clone();
+        let list = web
+            .state
+            .store
+            .run(move |s| s.reservations_of(&owner))
+            .await
+            .unwrap_or_default();
+        Some(pages::Reservations {
+            rows: list.iter().map(|r| web.reservation_view(r)).collect(),
+            max: web.cfg.max_reserved,
+            days: web.cfg.reservation_days,
+        })
+    } else {
+        None
+    };
+    pages::dashboard(&user.email, &tokens, &online, reservations.as_ref()).into_response()
+}
+
+#[derive(Deserialize)]
+struct NewReservation {
+    name: String,
+}
+
+async fn reserve(
+    State(web): State<Arc<Web>>,
+    headers: HeaderMap,
+    Form(form): Form<NewReservation>,
+) -> Response {
+    if !auth::same_origin(&headers) || !auth::is_htmx(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !web.reservations_on() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(user) = web.current_user(&headers).await else {
+        return to_login();
+    };
+    let name = form.name.trim().to_ascii_lowercase();
+    if crate::control::validate_subdomain(&name).is_err() {
+        return form_error(pages::token_error(pages::BAD_SUBDOMAIN));
+    }
+    if crate::control::is_banned(&name) {
+        return form_error(pages::token_error(&pages::banned(&name)));
+    }
+    // Em uso agora pelo túnel de outra conta (ou de um token do admin).
+    let busy = web
+        .state
+        .routes
+        .lock()
+        .unwrap()
+        .get(&name)
+        .is_some_and(|r| r.owner.as_deref() != Some(user.id.as_str()));
+    if busy {
+        return form_error(pages::token_error(&pages::in_use(&name)));
+    }
+    let (owner, max, n) = (user.id.clone(), web.cfg.max_reserved, name.clone());
+    match web.state.store.run(move |s| s.reserve(&owner, &n, max)).await {
+        Ok(r) => pages::reservation_created(&web.reservation_view(&r)).into_response(),
+        Err(e) => {
+            let msg = match e.downcast_ref::<StoreError>() {
+                Some(StoreError::ReservationQuota(n)) => pages::reservation_quota(*n),
+                Some(StoreError::Reserved(_)) => pages::taken(&name),
+                _ => {
+                    tracing::warn!("reserva falhou: {e:#}");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            form_error(pages::token_error(&msg))
+        }
+    }
+}
+
+async fn release(State(web): State<Arc<Web>>, headers: HeaderMap, Path(name): Path<String>) -> Response {
+    if !auth::same_origin(&headers) || !auth::is_htmx(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(user) = web.current_user(&headers).await else {
+        return to_login();
+    };
+    match web.state.store.run(move |s| s.release(&user.id, &name)).await {
+        // 200 vazio: o htmx troca a linha por nada. Um túnel aberto segue no ar.
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

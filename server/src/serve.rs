@@ -97,6 +97,8 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity, data_dir: 
         tokio::spawn(metrics::serve(l, state.metrics.clone()));
     }
 
+    tokio::spawn(expire_reservations(state.clone(), args.reservation_days));
+
     let mut site = None;
     if let Some(bind) = &args.web_bind {
         let l = TcpListener::bind(bind)
@@ -127,6 +129,8 @@ pub async fn serve(args: ServeArgs, store: Store, identity: Identity, data_dir: 
                 url,
                 signup_open: args.signup == Signup::Open,
                 max_tokens: args.max_tokens_per_user,
+                max_reserved: args.max_reserved_per_user,
+                reservation_days: args.reservation_days,
                 control_port: control_addr.port(),
                 fingerprint: identity.fingerprint(),
             },
@@ -184,4 +188,26 @@ async fn bind(addr: &str) -> Result<TcpListener> {
     TcpListener::bind(addr)
         .await
         .with_context(|| format!("não consegui abrir {addr}"))
+}
+
+/// De hora em hora, libera as reservas sem túnel aberto há `days` dias.
+async fn expire_reservations(state: Arc<State>, days: u64) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+    loop {
+        tick.tick().await;
+        let active: Vec<String> = state.routes.lock().unwrap().keys().cloned().collect();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            .saturating_sub(days * 24 * 60 * 60);
+        match state
+            .store
+            .run(move |s| s.expire_reservations(before, &active))
+            .await
+        {
+            Ok(gone) if !gone.is_empty() => info!("reservas liberadas por falta de uso: {}", gone.join(", ")),
+            Ok(_) => {}
+            Err(e) => warn!("não consegui expirar reservas: {e:#}"),
+        }
+    }
 }

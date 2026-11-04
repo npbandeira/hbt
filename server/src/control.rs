@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 use tracing::info;
 
-use crate::state::{OnlineGuard, RouteGuard, State};
+use crate::state::{OnlineGuard, Route, RouteGuard, State};
 use crate::tokens::TokenRecord;
 use crate::tunnel::run_tunnel;
 
@@ -123,7 +123,7 @@ async fn negotiate(
             let (s, port) = bind_port(state.tunnel_ip, &range, remote_port, UdpSocket::bind).await?;
             (Bound::Udp(s), Public::Port(port))
         }
-        TunnelSpec::Http { subdomain } => register_http(state, opener, subdomain, &record)?,
+        TunnelSpec::Http { subdomain } => register_http(state, opener, subdomain, &record).await?,
     };
     write_msg(stream, &ServerMsg::Registered { public }).await?;
     Ok((bound, record, online))
@@ -189,7 +189,76 @@ pub fn validate_subdomain(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn register_http(
+/// Nomes que nenhuma conta do site pode reservar nem abrir: parecem serviços do
+/// próprio domínio (golpe de phishing pronto) ou são do servidor. Os tokens do
+/// admin (`hbt-server token create`) não têm essa restrição.
+pub const BANNED_SUBDOMAINS: &[&str] = &[
+    "www",
+    "api",
+    "admin",
+    "administrator",
+    "root",
+    "hbt",
+    "app",
+    "mail",
+    "email",
+    "webmail",
+    "smtp",
+    "imap",
+    "pop",
+    "pop3",
+    "mx",
+    "ns",
+    "ns1",
+    "ns2",
+    "dns",
+    "ftp",
+    "sftp",
+    "ssh",
+    "vpn",
+    "login",
+    "signin",
+    "signup",
+    "register",
+    "account",
+    "accounts",
+    "auth",
+    "oauth",
+    "sso",
+    "id",
+    "dashboard",
+    "panel",
+    "console",
+    "status",
+    "static",
+    "assets",
+    "cdn",
+    "media",
+    "blog",
+    "docs",
+    "help",
+    "support",
+    "billing",
+    "pay",
+    "payment",
+    "payments",
+    "secure",
+    "security",
+    "abuse",
+    "postmaster",
+    "hostmaster",
+    "webmaster",
+    "autoconfig",
+    "autodiscover",
+    "localhost",
+    "test",
+];
+
+pub fn is_banned(name: &str) -> bool {
+    BANNED_SUBDOMAINS.contains(&name)
+}
+
+async fn register_http(
     state: &Arc<State>,
     opener: &Opener,
     requested: Option<String>,
@@ -200,39 +269,84 @@ fn register_http(
     };
     if let Some(s) = &requested {
         validate_subdomain(s)?;
-    }
-    // Checar e inserir sob o MESMO lock: senão dois clientes poderiam
-    // checar "livre" ao mesmo tempo e ambos registrar (race condition).
-    let mut routes = state.routes.lock().unwrap();
-    // Token com lista de subdomínios: só estes. Sem pedir nenhum, usa o
-    // primeiro livre da lista (em vez de sortear um que não seria dele).
-    let sub = match (requested, &record.subdomains) {
-        (Some(s), Some(list)) if !list.contains(&s) => {
-            bail!("subdomínio '{s}' não é permitido para o token '{}'", record.name)
+        if let Some(list) = &record.subdomains {
+            if !list.contains(s) {
+                bail!("subdomínio '{s}' não é permitido para o token '{}'", record.name);
+            }
         }
-        (Some(s), _) => s,
-        (None, Some(list)) => list
-            .iter()
-            .find(|c| !routes.contains_key(*c))
-            .cloned()
-            .context("todos os subdomínios deste token estão em uso")?,
+        if record.owner.is_some() && is_banned(s) {
+            bail!("o subdomínio '{s}' é do servidor e não pode ser usado");
+        }
+    }
+    // Dono da reserva de cada nome (consulta fora do lock das rotas).
+    let reserved_by = |name: String| {
+        let store = state.store.clone();
+        async move {
+            store
+                .run(move |s| Ok(s.reservation(&name)?.map(|r| r.owner)))
+                .await
+        }
+    };
+    let mine = |owner: &Option<String>| owner.is_none() || *owner == record.owner;
+
+    let sub = match (requested, &record.subdomains) {
+        (Some(s), _) => {
+            if !mine(&reserved_by(s.clone()).await?) {
+                bail!("o subdomínio '{s}' está reservado por outra conta");
+            }
+            s
+        }
+        // Token com lista de subdomínios: sem pedir nenhum, usa o primeiro livre
+        // da lista (em vez de sortear um que não seria dele).
+        (None, Some(list)) => {
+            let mut usable = Vec::new();
+            for c in list {
+                if mine(&reserved_by(c.clone()).await?) {
+                    usable.push(c.clone());
+                }
+            }
+            let routes = state.routes.lock().unwrap();
+            usable
+                .into_iter()
+                .find(|c| !routes.contains_key(c))
+                .context("todos os subdomínios deste token estão em uso")?
+        }
         (None, None) => loop {
             let candidate = format!("{:08x}", rand::random::<u32>());
-            if !routes.contains_key(&candidate) {
+            if reserved_by(candidate.clone()).await?.is_none()
+                && !state.routes.lock().unwrap().contains_key(&candidate)
+            {
                 break candidate;
             }
         },
     };
-    if routes.contains_key(&sub) {
-        bail!("subdomínio '{sub}' já está em uso");
+    let reserved = record.owner.is_some() && reserved_by(sub.clone()).await? == record.owner;
+
+    // Checar e inserir sob o MESMO lock: senão dois clientes poderiam
+    // checar "livre" ao mesmo tempo e ambos registrar (race condition).
+    {
+        let mut routes = state.routes.lock().unwrap();
+        if routes.contains_key(&sub) {
+            bail!("subdomínio '{sub}' já está em uso");
+        }
+        routes.insert(
+            sub.clone(),
+            Route {
+                opener: opener.clone(),
+                owner: record.owner.clone(),
+            },
+        );
     }
-    routes.insert(sub.clone(), opener.clone());
-    drop(routes);
+    if reserved {
+        let (store, name) = (state.store.clone(), sub.clone());
+        let _ = store.run(move |s| s.touch_reservation(&name)).await;
+    }
 
     let url = cfg.url(&sub);
     let guard = RouteGuard {
         state: state.clone(),
         subdomain: sub,
+        reserved,
     };
     Ok((Bound::Http(guard), Public::Url(url)))
 }

@@ -35,6 +35,27 @@ pub enum StoreError {
     NotFound(String),
     #[error("'{0}' é ambíguo: use o id")]
     Ambiguous(String),
+    #[error("limite de {0} subdomínios reservados atingido")]
+    ReservationQuota(usize),
+    #[error("o subdomínio '{0}' já está reservado")]
+    Reserved(String),
+}
+
+/// Um subdomínio reservado por uma conta do site: só os tokens dela o abrem.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub name: String,
+    pub owner: String,
+    /// Último túnel aberto ou fechado com este nome (ou a reserva, se nunca usado).
+    pub last_used: u64,
+}
+
+fn reservation_row(r: &Row<'_>) -> rusqlite::Result<Reservation> {
+    Ok(Reservation {
+        name: r.get("name")?,
+        owner: r.get("owner")?,
+        last_used: r.get::<_, i64>("last_used")?.try_into().unwrap_or(0),
+    })
 }
 
 /// Uma conta do site.
@@ -68,6 +89,13 @@ CREATE TABLE IF NOT EXISTS users (
     created_at     INTEGER NOT NULL,
     disabled       INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS reservations (
+    name        TEXT PRIMARY KEY,
+    owner       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reservations_owner ON reservations(owner);
 ";
 
 #[derive(Clone)]
@@ -410,6 +438,7 @@ impl Store {
                 params![user.id, disabled],
             )?;
             let revoked = if disabled {
+                tx.execute("DELETE FROM reservations WHERE owner = ?1", [&user.id])?;
                 tx.execute("DELETE FROM tokens WHERE owner = ?1", [&user.id])?
             } else {
                 0
@@ -439,9 +468,102 @@ impl Store {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let user = Store::user_by_ident(&tx, ident)?;
             let revoked = tx.execute("DELETE FROM tokens WHERE owner = ?1", [&user.id])?;
+            tx.execute("DELETE FROM reservations WHERE owner = ?1", [&user.id])?;
             tx.execute("DELETE FROM users WHERE id = ?1", [&user.id])?;
             tx.commit()?;
             Ok((user, revoked))
+        })
+    }
+
+    // -------------------------------------------------------------- reservas
+
+    /// Reserva `name` para a conta, respeitando o limite por conta na mesma
+    /// transação. Quem valida o nome (formato, proibidos, em uso) é quem chama.
+    pub fn reserve(&self, owner: &str, name: &str, max: usize) -> Result<Reservation> {
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM reservations WHERE owner = ?1",
+                [owner],
+                |r| r.get(0),
+            )?;
+            if usize::try_from(n).unwrap_or(usize::MAX) >= max {
+                return Err(StoreError::ReservationQuota(max).into());
+            }
+            let t = now();
+            match tx.execute(
+                "INSERT INTO reservations (name, owner, created_at, last_used) VALUES (?1, ?2, ?3, ?3)",
+                params![name, owner, secs_i64(t)],
+            ) {
+                Err(e) if is_unique(&e) => return Err(StoreError::Reserved(name.to_owned()).into()),
+                other => other?,
+            };
+            tx.commit()?;
+            Ok(Reservation {
+                name: name.to_owned(),
+                owner: owner.to_owned(),
+                last_used: t,
+            })
+        })
+    }
+
+    /// Libera só se a reserva for da conta.
+    pub fn release(&self, owner: &str, name: &str) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.execute(
+                "DELETE FROM reservations WHERE name = ?1 AND owner = ?2",
+                [name, owner],
+            )? > 0)
+        })
+    }
+
+    pub fn reservation(&self, name: &str) -> Result<Option<Reservation>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT * FROM reservations WHERE name = ?1",
+                [name],
+                reservation_row,
+            )
+            .optional()?)
+        })
+    }
+
+    pub fn reservations_of(&self, owner: &str) -> Result<Vec<Reservation>> {
+        self.with(|c| {
+            let mut st =
+                c.prepare("SELECT * FROM reservations WHERE owner = ?1 ORDER BY created_at, name")?;
+            let rows = st.query_map([owner], reservation_row)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    /// Marca a reserva como usada agora (túnel aberto ou fechado com o nome).
+    pub fn touch_reservation(&self, name: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE reservations SET last_used = ?2 WHERE name = ?1",
+                params![name, secs_i64(now())],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Apaga as reservas sem uso desde `before` que não estão com túnel aberto
+    /// (`active`). Devolve os nomes liberados.
+    pub fn expire_reservations(&self, before: u64, active: &[String]) -> Result<Vec<String>> {
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let stale: Vec<String> = {
+                let mut st = tx.prepare("SELECT name FROM reservations WHERE last_used < ?1")?;
+                let rows = st.query_map([secs_i64(before)], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let gone: Vec<String> = stale.into_iter().filter(|n| !active.contains(n)).collect();
+            for n in &gone {
+                tx.execute("DELETE FROM reservations WHERE name = ?1", [n])?;
+            }
+            tx.commit()?;
+            Ok(gone)
         })
     }
 }
@@ -589,6 +711,54 @@ mod tests {
             err_of(s.remove_user("ana@x.com")),
             StoreError::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn reservations_respect_quota_uniqueness_and_ownership() {
+        let s = Store::memory().unwrap();
+        s.reserve("u1", "ana", 2).unwrap();
+        s.reserve("u1", "ana-dev", 2).unwrap();
+        assert!(matches!(
+            err_of(s.reserve("u1", "ana-3", 2)),
+            StoreError::ReservationQuota(2)
+        ));
+        assert!(matches!(
+            err_of(s.reserve("u2", "ana", 2)),
+            StoreError::Reserved(_)
+        ));
+        assert!(!s.release("u2", "ana").unwrap(), "não libera reserva alheia");
+        assert!(s.release("u1", "ana").unwrap());
+        s.reserve("u2", "ana", 2).unwrap();
+        assert_eq!(s.reservation("ana").unwrap().unwrap().owner, "u2");
+        assert_eq!(s.reservations_of("u1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stale_reservations_expire_unless_in_use() {
+        let s = Store::memory().unwrap();
+        s.reserve("u", "parada", 5).unwrap();
+        s.reserve("u", "aberta", 5).unwrap();
+        let later = now() + 10;
+        let gone = s.expire_reservations(later, &["aberta".to_owned()]).unwrap();
+        assert_eq!(gone, ["parada"]);
+        assert!(s.reservation("aberta").unwrap().is_some());
+        assert!(
+            s.expire_reservations(now() - 10, &[]).unwrap().is_empty(),
+            "usada há pouco fica"
+        );
+    }
+
+    #[test]
+    fn disabling_or_removing_a_user_releases_their_reservations() {
+        let s = Store::memory().unwrap();
+        let a = s.add_user("a@x.com", "h").unwrap();
+        let b = s.add_user("b@x.com", "h").unwrap();
+        s.reserve(&a.id, "aa", 3).unwrap();
+        s.reserve(&b.id, "bb", 3).unwrap();
+        s.set_disabled("a@x.com", true).unwrap();
+        assert!(s.reservation("aa").unwrap().is_none());
+        s.remove_user("b@x.com").unwrap();
+        assert!(s.reservation("bb").unwrap().is_none());
     }
 
     #[test]

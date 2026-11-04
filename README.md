@@ -98,6 +98,11 @@ hbt-server user disable ana@exemplo.com   # bloqueia e revoga TODOS os tokens de
   `hbt-server user add <e-mail>` (a senha é gerada e mostrada uma vez). O padrão,
   `open`, é como o ngrok; o abuso é limitado por `--max-tokens-per-user` (padrão 5),
   por limite de tentativas por IP e pelo `user disable`.
+- **Subdomínios reservados:** no painel, cada conta reserva até 3 nomes
+  (`--max-reserved-per-user`, `0` desliga) que só os tokens dela abrem. A reserva
+  cai depois de 30 dias sem túnel usando o nome (`--reservation-days`) ou quando
+  a conta é bloqueada ou apagada. Nomes como `www`, `api`, `admin` e `mail` não
+  podem ser reservados nem abertos por contas do site (os tokens do admin podem).
 - Sem verificação de e-mail (exigiria SMTP): quem se cadastra não prova que o e-mail é seu.
 - As sessões ficam em memória: reiniciar o servidor desloga todos.
 - O CSS do site é gerado pelo Tailwind e fica commitado. Se mudar classes em

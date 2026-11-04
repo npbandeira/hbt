@@ -33,7 +33,7 @@ pub struct State {
     /// segurar o lock ATRAVÉS de um `.await`. O compilador te protege: um
     /// guard de std Mutex não é `Send`, então segurá-lo num await dentro de
     /// um `spawn` dá erro de compilação.
-    pub routes: Mutex<HashMap<String, Opener>>,
+    pub routes: Mutex<HashMap<String, Route>>,
     pub metrics: Arc<Metrics>,
     /// token id -> sessões de túnel abertas agora (o painel do site mostra o LED).
     pub online: Mutex<HashMap<String, usize>>,
@@ -117,15 +117,31 @@ impl HttpCfg {
     }
 }
 
-/// Remove a rota HTTP quando o túnel acaba (RAII, como `AbortOnDrop`).
+/// Um túnel HTTP no ar: por onde abrir streams até o cliente e de qual conta
+/// do site ele é (None = token do admin).
+#[derive(Clone)]
+pub struct Route {
+    pub opener: Opener,
+    pub owner: Option<String>,
+}
+
+/// Remove a rota HTTP quando o túnel acaba (RAII, como `AbortOnDrop`) e, se o
+/// nome era uma reserva da conta, marca o uso (a reserva expira sem uso).
 pub struct RouteGuard {
     pub state: Arc<State>,
     pub subdomain: String,
+    pub reserved: bool,
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
         self.state.routes.lock().unwrap().remove(&self.subdomain);
+        if self.reserved {
+            let (store, name) = (self.state.store.clone(), std::mem::take(&mut self.subdomain));
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn_blocking(move || store.touch_reservation(&name));
+            }
+        }
     }
 }
 
