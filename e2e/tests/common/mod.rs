@@ -225,7 +225,7 @@ pub async fn banner_url(mut c: Command) -> (Child, String) {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let url = timeout(Duration::from_secs(10), async {
         while let Some(line) = lines.next_line().await.unwrap() {
-            if let Some(rest) = line.strip_prefix("Forwarding") {
+            if let Some(rest) = line.trim_start().strip_prefix("Forwarding") {
                 return rest.split_whitespace().next().unwrap().to_owned();
             }
         }

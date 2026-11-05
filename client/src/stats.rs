@@ -43,6 +43,41 @@ pub fn add_bytes(inn: u64, out: u64) {
     BYTES_OUT.fetch_add(out, Relaxed);
 }
 
+// Cores do site (`--c-accent`, amarelo e vermelho de app.css). Sem cor em pipe nem com NO_COLOR.
+pub const BRAND: &str = "1;38;2;176;41;143";
+pub const YELLOW: &str = "38;2;255;192;19";
+pub const RED: &str = "38;2;220;60;60";
+pub const GREEN: &str = "38;2;80;190;120";
+pub const DIM: &str = "2";
+pub const BOLD: &str = "1";
+
+fn color(tty: bool) -> bool {
+    tty && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Pinta para o stdout (banner e log).
+pub fn paint(code: &str, s: &str) -> String {
+    paint_if(color(std::io::stdout().is_terminal()), code, s)
+}
+
+fn paint_if(on: bool, code: &str, s: &str) -> String {
+    if on {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Cor do status HTTP: 2xx verde, 3xx normal, 4xx amarelo, 5xx vermelho.
+pub fn status_color(code: u16) -> &'static str {
+    match code {
+        200..=299 => GREEN,
+        400..=499 => YELLOW,
+        500..=599 => RED,
+        _ => DIM,
+    }
+}
+
 fn human(n: u64) -> String {
     const U: [&str; 4] = ["B", "KB", "MB", "GB"];
     let (mut v, mut i) = (n as f64, 0);
@@ -78,17 +113,23 @@ pub fn spawn_status() {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
-            let state = match STATE.load(Relaxed) {
-                1 => "online",
-                2 => "reconnecting",
-                _ => "connecting",
+            let on = color(true);
+            let (dot, state) = match STATE.load(Relaxed) {
+                1 => (BRAND, "online"),
+                2 => (YELLOW, "reconnecting"),
+                _ => (DIM, "connecting"),
             };
-            eprint!(
-                "\r\x1b[2K  {state} · {} conn ({} total) · in {} out {}",
+            let rest = format!(
+                "{state} · {} conn ({} total) · ↓ {} ↑ {}",
                 OPEN.load(Relaxed),
                 TOTAL.load(Relaxed),
                 human(BYTES_IN.load(Relaxed)),
                 human(BYTES_OUT.load(Relaxed)),
+            );
+            eprint!(
+                "\r\x1b[2K  {} {}",
+                paint_if(on, dot, "●"),
+                paint_if(on, DIM, &rest)
             );
             let _ = std::io::stderr().flush();
         }

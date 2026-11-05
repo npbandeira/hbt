@@ -5,6 +5,15 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-05
+
+Só o `hbt` (cliente) muda: protocolo igual, o servidor não precisa de atualização.
+
+### Alterado
+
+- Banner, log de requisições e painel de status com as cores do site (magenta do `hbt`; status HTTP verde/amarelo/vermelho). Sem cor em pipe nem com `NO_COLOR`.
+- O banner passa a ter dois espaços de recuo; scripts que procuram `Forwarding` no começo da linha devem aceitar o recuo.
+
 ## [2.2.0] - 2026-11-05
 
 Só o `hbt` (cliente) muda: protocolo igual, o servidor não precisa de atualização.

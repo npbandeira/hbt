@@ -70,8 +70,10 @@ async fn http_copy(stream: &mut MuxStream, svc: &mut TcpStream) -> std::io::Resu
         let m = vr.read(&mut head).await?;
         if let (Some((method, path)), Some(code)) = (&req, parse_status(&head[..m])) {
             stats::log(&format!(
-                "{method} {path} {code} {}ms",
-                start.elapsed().as_millis()
+                "  {:<7} {path}  {}  {}",
+                stats::paint(stats::BOLD, method),
+                stats::paint(stats::status_color(code), &code.to_string()),
+                stats::paint(stats::DIM, &format!("{}ms", start.elapsed().as_millis())),
             ));
         }
         sw.write_all(&head[..m]).await?;

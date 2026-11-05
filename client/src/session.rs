@@ -36,8 +36,19 @@ fn print_banner(conn: &Conn, plan: &Plan, public: &Public) {
             format!("{scheme}://{host}:{p}")
         }
     };
-    println!("\nhbt                                            (Ctrl+C para sair)\n");
-    println!("Forwarding    {url}  ->  {}\n", plan.local);
+    println!(
+        "\n  {} {}  {}\n",
+        stats::paint(stats::BRAND, "● hbt"),
+        stats::paint(stats::DIM, concat!("v", env!("CARGO_PKG_VERSION"))),
+        stats::paint(stats::DIM, "(Ctrl+C para sair)"),
+    );
+    println!(
+        "  {}  {}  {}  {}\n",
+        stats::paint(stats::DIM, "Forwarding"),
+        stats::paint(stats::BOLD, &url),
+        stats::paint(stats::DIM, "->"),
+        plan.local
+    );
 }
 
 /// Reconecta para sempre com *exponential backoff*: espera 1s, 2s, 4s... até

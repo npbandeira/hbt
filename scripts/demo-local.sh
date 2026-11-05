@@ -70,7 +70,7 @@ start_client() {
   PIDS+=("$CLIENT_PID")
   BANNER_URL=""
   for _ in $(seq 50); do
-    BANNER_URL=$(sed -n 's/^Forwarding *\([^ ]*\).*/\1/p' "$log" | head -n1)
+    BANNER_URL=$(sed -n 's/^ *Forwarding *\([^ ]*\).*/\1/p' "$log" | head -n1)
     [[ -n "$BANNER_URL" ]] && return 0
     kill -0 "$CLIENT_PID" 2>/dev/null || return 1
     sleep 0.1
