@@ -31,12 +31,21 @@ pub struct Cli {
 pub enum Cmd {
     /// Salva servidor, token e fingerprint para não precisar repeti-los (sem argumentos: mostra o atual).
     Configure,
+    /// Atualiza o hbt para a versão mais recente (roda o install.sh da release).
+    Update(UpdateArgs),
     /// Expõe um servidor web local numa URL pública, ex: `hbt http 3000`.
     Http(HttpArgs),
     /// Expõe um serviço TCP local numa porta pública, ex: `hbt tcp 22`.
     Tcp(PortArgs),
     /// Expõe um serviço UDP local numa porta pública, ex: `hbt udp 51820`.
     Udp(PortArgs),
+}
+
+#[derive(ClapArgs)]
+pub struct UpdateArgs {
+    /// Versão específica, ex: `v2.1.1` (padrão: a mais recente).
+    #[arg(long)]
+    pub version: Option<String>,
 }
 
 #[derive(ClapArgs)]
@@ -80,10 +89,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// `None` para comandos que não abrem túnel (configure).
+    /// `None` para comandos que não abrem túnel (configure, update).
     pub fn from_cmd(cmd: &Cmd) -> Option<Plan> {
         Some(match cmd {
-            Cmd::Configure => return None,
+            Cmd::Configure | Cmd::Update(_) => return None,
             Cmd::Http(a) => Plan {
                 spec: TunnelSpec::Http {
                     subdomain: a.subdomain.clone(),
@@ -144,6 +153,27 @@ pub fn configure(cli: &Cli) -> Result<()> {
     }
     let path = config::save(&cfg)?;
     println!("configuração salva em {}", path.display());
+    Ok(())
+}
+
+/// Reinstala por cima deste binário com o `install.sh` da release (confere o SHA-256).
+/// Respeita `HBT_REPO` e `HBT_DOWNLOAD_URL`, como o próprio script.
+// shortcut: precisa de sh e curl, ou seja, só Linux/macOS; no Windows baixe o .exe do release.
+pub fn update(a: &UpdateArgs) -> Result<()> {
+    let exe = std::env::current_exe().context("não achei o caminho do executável")?;
+    let dir = exe.parent().context("executável sem diretório")?;
+    let repo = std::env::var("HBT_REPO").unwrap_or_else(|_| "npbandeira/hbt".into());
+    let url = format!("https://github.com/{repo}/releases/latest/download/install.sh");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", r#"curl -fsSL "$0" | sh -s -- "$@""#, &url, "--dir"])
+        .arg(dir);
+    if let Some(v) = &a.version {
+        cmd.args(["--version", v]);
+    }
+    let status = cmd
+        .status()
+        .context("não consegui rodar sh (o update só funciona em Linux/macOS)")?;
+    anyhow::ensure!(status.success(), "update falhou ({status})");
     Ok(())
 }
 

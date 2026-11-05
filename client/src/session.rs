@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::cli::{Conn, Plan};
 use crate::forward::{tcp_conn, udp_data};
+use crate::stats::{self, State};
 
 /// Erro que não adianta tentar de novo (ex.: token errado).
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +61,7 @@ pub async fn reconnect_loop(conn: &Conn, plan: &Plan) -> Result<()> {
         if registered {
             delay = Duration::from_secs(1); // estava saudável: recomeça rápido
         }
+        stats::set_state(State::Reconnecting);
         warn!("reconectando em {delay:?}");
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_secs(30));
@@ -138,6 +140,7 @@ async fn serve_session(
     {
         ServerMsg::Registered { public } => {
             print_banner(conn, plan, &public);
+            stats::set_state(State::Online);
             *registered = true;
         }
         // Pode ser transitório (servidor ainda não notou que a sessão antiga
@@ -150,9 +153,10 @@ async fn serve_session(
     // ou manda datagramas (UDP); nós só recebemos.
     let _dispatcher = AbortOnDrop(tokio::spawn({
         let (quic_conn, local) = (quic_conn.clone(), plan.local.clone());
+        let http = matches!(plan.spec, TunnelSpec::Http { .. });
         async move {
             while let Ok((send, recv)) = quic_conn.accept_bi().await {
-                tokio::spawn(dispatch(send, recv, local.clone()));
+                tokio::spawn(dispatch(send, recv, local.clone(), http));
             }
         }
     }));
@@ -199,14 +203,14 @@ async fn serve_session(
 }
 
 /// Um stream aberto pelo servidor para um usuário público.
-async fn dispatch(send: quinn::SendStream, recv: quinn::RecvStream, local: String) {
+async fn dispatch(send: quinn::SendStream, recv: quinn::RecvStream, local: String, http: bool) {
     let (kind, stream) = match MuxStream::accept(send, recv).await {
         Ok(x) => x,
         Err(e) => return debug!("stream inválido: {e}"),
     };
     match kind {
         StreamKind::Conn => {
-            if let Err(e) = tcp_conn(stream, &local).await {
+            if let Err(e) = tcp_conn(stream, &local, http).await {
                 warn!("conexão TCP: {e:#}");
             }
         }

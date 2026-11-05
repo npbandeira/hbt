@@ -5,6 +5,15 @@ O workflow `release` publica como notas da release a seção da versão da tag.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-05
+
+Só o `hbt` (cliente) muda: protocolo igual, o servidor não precisa de atualização.
+
+### Adicionado
+
+- `hbt update [--version vX.Y.Z]`: reinstala o cliente por cima do binário atual com o `install.sh` da release (confere o SHA-256). Só Linux/macOS.
+- Painel de status no terminal (estado, conexões, bytes) e, no `hbt http`, log `GET /caminho 200 12ms` da primeira requisição de cada conexão.
+
 ## [2.1.1] - 2026-11-03
 
 Só o `hbt-server` mudou: protocolo e banco iguais aos da 2.1.0.

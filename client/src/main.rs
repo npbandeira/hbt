@@ -5,6 +5,7 @@
 //!   hbt http 3000          # URL pública para o site local na porta 3000
 //!   hbt tcp 22             # porta pública (sorteada) para o ssh local
 //!   hbt udp 51820          # idem para UDP
+//!   hbt update             # atualiza para a versão mais recente
 //!
 //! "Reverse" tunnel: quem inicia a conexão é o cliente (saída), então funciona
 //! atrás de NAT/firewall sem abrir nenhuma porta de entrada. É UMA conexão QUIC
@@ -15,12 +16,13 @@ mod cli;
 mod config;
 mod forward;
 mod session;
+mod stats;
 
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use cli::{configure, resolve, Cli, Plan};
+use cli::{configure, resolve, update, Cli, Cmd, Plan};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,9 +36,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let Some(plan) = Plan::from_cmd(&cli.cmd) else {
-        return configure(&cli);
+        return match &cli.cmd {
+            Cmd::Update(a) => update(a),
+            _ => configure(&cli),
+        };
     };
     let conn = resolve(&cli)?;
+
+    stats::spawn_status();
 
     // Ctrl-C encerra limpo. `select!` roda os dois futures e termina quando
     // o PRIMEIRO completar, descartando o outro.
